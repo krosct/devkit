@@ -654,33 +654,23 @@ unpublish_site() {
 # 525/526: o Cloudflare não aceitou a conexão segura com a VPS. Explica e dá as duas saídas.
 cert_advice() { # código
     if [ -f "$(cert_base).pem" ]; then
-        printf 'o Cloudflare recusou o certificado instalado na VPS (erro %s): %s.pem
-' "$1" "$(cert_base)"
-        printf 'pode estar vencido, ser de outro domínio ou de outra conta do Cloudflare. Gere um novo em
-'
+        echo "o Cloudflare recusou o certificado instalado na VPS (erro $1): $(cert_base).pem"
+        echo "Ele pode estar vencido, ser de outro domínio ou de outra conta do Cloudflare. Gere um novo"
     else
-        printf 'o Cloudflare não conseguiu uma conexão segura com a VPS (erro %s): ela não tem certificado.
-' "$1"
-        printf 'Com o domínio no Cloudflare (nuvem laranja), o Let'"'"'s Encrypt costuma falhar: gere um
-'
+        echo "o Cloudflare não conseguiu uma conexão segura com a VPS (erro $1): ela não tem certificado."
+        echo "Com o domínio no Cloudflare (nuvem laranja), o Let's Encrypt costuma falhar: gere um"
     fi
-    printf 'Certificado de Origem no painel do Cloudflare (SSL/TLS → Origin Server → Create Certificate)
-'
-    printf 'e envie-o por uma destas formas:
-'
-    printf '  A) pelo GitHub (fica para todos os próximos deploys): no repositório do projeto, crie os
-'
-    printf '     secrets DEPLOY_ORIGIN_CERT (o certificado, .pem) e DEPLOY_ORIGIN_KEY (a chave privada)
-'
-    printf '     e rode o deploy de novo (Actions → CI/CD → Run workflow);
-'
-    printf '  B) pela sua máquina, uma vez: na pasta do projeto,
-'
-    printf '     deploy.sh vps HOST --cert CERTIFICADO.pem --key CHAVE.key
-'
-    printf '     (a configuração do app na VPS é mantida; só o certificado é instalado).
-'
-    printf 'No Cloudflare, deixe o SSL/TLS no modo "Full (strict)".'
+    cat <<'EOF'
+Certificado de Origem no painel do Cloudflare (SSL/TLS → Origin Server → Create Certificate)
+e envie-o por uma destas formas:
+  A) pelo GitHub (fica para todos os próximos deploys): no repositório do projeto, crie os
+     secrets DEPLOY_ORIGIN_CERT (o certificado, .pem) e DEPLOY_ORIGIN_KEY (a chave privada)
+     e rode o deploy de novo (Actions → CI/CD → Run workflow);
+  B) pela sua máquina, uma vez: na pasta do projeto,
+     deploy.sh vps HOST --cert CERTIFICADO.pem --key CHAVE.key
+     (a configuração do app na VPS é mantida; só o certificado é instalado).
+No Cloudflare, deixe o SSL/TLS no modo "Full (strict)".
+EOF
 }
 
 # Acessa o endereço público como um usuário faria (DNS, Cloudflare, certificado, Caddy, app).
