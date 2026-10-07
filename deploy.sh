@@ -651,6 +651,38 @@ unpublish_site() {
     log "Site do $APP removido do Caddy"
 }
 
+# 525/526: o Cloudflare não aceitou a conexão segura com a VPS. Explica e dá as duas saídas.
+cert_advice() { # código
+    if [ -f "$(cert_base).pem" ]; then
+        printf 'o Cloudflare recusou o certificado instalado na VPS (erro %s): %s.pem
+' "$1" "$(cert_base)"
+        printf 'pode estar vencido, ser de outro domínio ou de outra conta do Cloudflare. Gere um novo em
+'
+    else
+        printf 'o Cloudflare não conseguiu uma conexão segura com a VPS (erro %s): ela não tem certificado.
+' "$1"
+        printf 'Com o domínio no Cloudflare (nuvem laranja), o Let'"'"'s Encrypt costuma falhar: gere um
+'
+    fi
+    printf 'Certificado de Origem no painel do Cloudflare (SSL/TLS → Origin Server → Create Certificate)
+'
+    printf 'e envie-o por uma destas formas:
+'
+    printf '  A) pelo GitHub (fica para todos os próximos deploys): no repositório do projeto, crie os
+'
+    printf '     secrets DEPLOY_ORIGIN_CERT (o certificado, .pem) e DEPLOY_ORIGIN_KEY (a chave privada)
+'
+    printf '     e rode o deploy de novo (Actions → CI/CD → Run workflow);
+'
+    printf '  B) pela sua máquina, uma vez: na pasta do projeto,
+'
+    printf '     deploy.sh vps HOST --cert CERTIFICADO.pem --key CHAVE.key
+'
+    printf '     (a configuração do app na VPS é mantida; só o certificado é instalado).
+'
+    printf 'No Cloudflare, deixe o SSL/TLS no modo "Full (strict)".'
+}
+
 # Acessa o endereço público como um usuário faria (DNS, Cloudflare, certificado, Caddy, app).
 public_problem() { # url-de-saúde -> imprime o problema (vazio = respondeu 200)
     local code=""
@@ -664,7 +696,7 @@ public_problem() { # url-de-saúde -> imprime o problema (vazio = respondeu 200)
     done
     case $code in
         000 | "") echo "sem resposta. O domínio existe no DNS e aponta para esta VPS? As portas 80/443 estão abertas?" ;;
-        525 | 526) echo "o Cloudflare recusou o certificado da VPS (erro $code). No SSL \"Full (strict)\", rode o deploy com --cert e --key." ;;
+        525 | 526) cert_advice "$code" ;;
         403) echo "bloqueado com 403 (no Cloudflare, é a proteção contra bots ou uma regra do WAF barrando a conferência)." ;;
         52[0-4]) echo "o Cloudflare não conseguiu falar com a VPS (erro $code). As portas 80/443 estão abertas para ele?" ;;
         *) echo "$1 respondeu $code em vez de 200." ;;
