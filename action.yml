@@ -1,0 +1,64 @@
+# Deploy pelo devkit no CI: o mesmo "deploy.sh vps", sem terminal (nada é perguntado; o que
+# faltar vira erro). Use depois do actions/checkout do projeto (que tem o deploy.conf).
+name: devkit deploy
+description: Publica o projeto da pasta atual na VPS com o devkit (serviço, HTTPS e conferência de fora).
+
+inputs:
+  host:
+    description: IP ou nome da VPS (secret DEPLOY_HOST)
+    required: true
+  user:
+    description: usuário do SSH (secret DEPLOY_USER)
+    required: true
+  port:
+    description: porta do SSH
+    required: false
+    default: '22'
+  ssh-key:
+    description: chave privada do SSH (secret DEPLOY_SSH_KEY)
+    required: true
+  known-hosts:
+    description: saída de ssh-keyscan da VPS (secret DEPLOY_KNOWN_HOSTS)
+    required: true
+  path:
+    description: pasta do app na VPS (padrão /srv/<app>)
+    required: false
+    default: ''
+  domain:
+    description: domínio público; vazio mantém o que a VPS já usa
+    required: false
+    default: ''
+  origin-cert:
+    description: Certificado de Origem do Cloudflare (PEM), opcional
+    required: false
+    default: ''
+  origin-key:
+    description: chave privada do Certificado de Origem (PEM), opcional
+    required: false
+    default: ''
+  secrets:
+    description: '${{ toJSON(secrets) }}: de onde saem as chaves ENV do deploy.conf'
+    required: true
+  vars:
+    description: '${{ toJSON(vars) }}: alternativa aos secrets para o que não é segredo'
+    required: false
+    default: '{}'
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy na VPS
+      shell: bash
+      env:
+        DEVKIT_HOST: ${{ inputs.host }}
+        DEVKIT_USER: ${{ inputs.user }}
+        DEVKIT_PORT: ${{ inputs.port }}
+        DEVKIT_SSH_KEY: ${{ inputs.ssh-key }}
+        DEVKIT_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        DEVKIT_PATH: ${{ inputs.path }}
+        DEVKIT_DOMAIN: ${{ inputs.domain }}
+        DEVKIT_ORIGIN_CERT: ${{ inputs.origin-cert }}
+        DEVKIT_ORIGIN_KEY: ${{ inputs.origin-key }}
+        DEVKIT_SECRETS: ${{ inputs.secrets }}
+        DEVKIT_VARS: ${{ inputs.vars }}
+      run: '"$GITHUB_ACTION_PATH/deploy.sh" ci'
