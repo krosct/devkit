@@ -37,10 +37,10 @@ inputs:
     required: false
     default: ''
   secrets:
-    description: '${{ toJSON(secrets) }}: de onde saem as chaves ENV do deploy.conf'
+    description: 'passe toJSON(secrets) do workflow: de onde saem as chaves ENV do deploy.conf'
     required: true
   vars:
-    description: '${{ toJSON(vars) }}: alternativa aos secrets para o que não é segredo'
+    description: 'passe toJSON(vars) do workflow: alternativa aos secrets para o que não é segredo'
     required: false
     default: '{}'
 
