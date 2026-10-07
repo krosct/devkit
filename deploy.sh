@@ -33,6 +33,7 @@ PORT_MAX=29999
 APP_RE='^[a-z][a-z0-9-]{1,30}$'
 DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
 RELEASE_RE='^[A-Za-z0-9._-]+$'
+BROWSER_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
@@ -654,15 +655,17 @@ unpublish_site() {
 public_problem() { # url-de-saúde -> imprime o problema (vazio = respondeu 200)
     local code=""
     command -v curl >/dev/null 2>&1 || { warn "sem curl na VPS: não conferi $1 de fora."; return 0; }
-    # Na 1ª vez, o Let's Encrypt pode levar alguns segundos para emitir o certificado.
+    # Na 1ª vez, o Let's Encrypt pode levar alguns segundos para emitir o certificado. O agente é
+    # o de um navegador: a proteção contra bots do Cloudflare bloqueia o do curl (403).
     for _ in $(seq 12); do
-        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" || true)
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -A "$BROWSER_UA" "$1" || true)
         [ "$code" = 200 ] && return 0
         sleep 5
     done
     case $code in
         000 | "") echo "sem resposta. O domínio existe no DNS e aponta para esta VPS? As portas 80/443 estão abertas?" ;;
         525 | 526) echo "o Cloudflare recusou o certificado da VPS (erro $code). No SSL \"Full (strict)\", rode o deploy com --cert e --key." ;;
+        403) echo "bloqueado com 403 (no Cloudflare, é a proteção contra bots ou uma regra do WAF barrando a conferência)." ;;
         52[0-4]) echo "o Cloudflare não conseguiu falar com a VPS (erro $code). As portas 80/443 estão abertas para ele?" ;;
         *) echo "$1 respondeu $code em vez de 200." ;;
     esac
