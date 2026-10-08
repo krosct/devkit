@@ -26,6 +26,7 @@ ou `usuario@host`. O resto é opcional:
 | `--cert ARQUIVO --key ARQUIVO` | Certificado de Origem do Cloudflare (SSL "Full (strict)") |
 | `--env ARQUIVO` | substitui a configuração do app na VPS por este arquivo |
 | `--path PASTA` | pasta do app na VPS (padrão: `/srv/<app>`) |
+| `--no-preserve` | gera de novo as chaves `PRESERVE` que não vierem na configuração nova |
 
 O que faltar é perguntado no terminal, e a resposta fica guardada na VPS (o próximo deploy não
 pergunta de novo):
@@ -54,6 +55,7 @@ INSTALL="uv sync --frozen --no-dev"           # na VPS, dentro da versão nova
 RUN=".venv/bin/meu-app --port {port}"         # na VPS, o processo do serviço
 HEALTH=/healthz                               # caminho que responde 200 (sem ele, o app não tem site)
 REQUIRED="TOKEN API_KEY"                      # configuração obrigatória
+PRESERVE="LOG_HASH_SALT"                      # opcional: sobrevivem aos deploys (veja abaixo)
 SERVICE_ENV="DATA_DIR={data} PORT={port} PUBLIC_URL={url}"   # variáveis fixas do serviço
 ENV="TOKEN API_KEY GITHUB_CLIENT_ID=GH_OAUTH_CLIENT_ID"      # CI: chaves lidas dos secrets
 ```
@@ -62,6 +64,15 @@ Em `RUN` e `SERVICE_ENV`: `{root}` (pasta do app), `{data}` (dados persistentes)
 interna, só em 127.0.0.1, escolhida pelo devkit sem conflito com outros apps), `{domain}` e `{url}`
 (`https://dominio`, ou vazio sem domínio). Na VPS, `uv` e o Python dele já estão no `PATH` do
 `INSTALL` e do `RUN`.
+
+`RUN` é **um comando só**: o devkit faz `exec <RUN>` na pasta da versão. Em vez de
+`cd backend && uvicorn ...`, use as opções do próprio programa (ex.: `uvicorn --app-dir backend ...`).
+
+**`PRESERVE`**: chaves da configuração que sobrevivem aos deploys, para valores que o servidor pode
+inventar (um salt, uma chave interna). A cada deploy: um valor novo e explícito (do `--env`, dos
+secrets) vence; sem ele, fica o que já está na VPS; sem nenhum, o devkit gera um aleatório (48
+caracteres hex) e o guarda. `--no-preserve` (ou `no-preserve: 'true'` na action) ignora os valores
+guardados e gera de novo o que não vier na configuração nova.
 
 ## Na VPS
 
@@ -91,6 +102,13 @@ instalada). Qualquer outra coisa, como outro Caddy rodando ou outro programa nas
 para o deploy com o motivo, antes de mexer em qualquer app. O site novo é validado junto com os dos
 outros apps antes de entrar (dois apps com o mesmo domínio, por exemplo, são recusados), e um
 reload recusado restaura o anterior.
+
+Todo site sai comprimido (zstd ou gzip) e o app recebe o **IP real do visitante** em
+`X-Forwarded-For` e `X-Real-IP`. Atrás do Cloudflare, ele vem do `CF-Connecting-IP`, aceito só das
+faixas do Cloudflare: de qualquer outro lugar o cabeçalho é ignorado, então não dá para falsificar
+o IP. Em apps Python com uvicorn, use `--proxy-headers --forwarded-allow-ips 127.0.0.1`.
+Uma VPS com a camada de uma versão anterior é atualizada no próximo deploy (com sudo), por reload,
+sem derrubar os sites.
 
 A versão nova só fica se o serviço continuar de pé e, com site, responder no `HEALTH`; senão volta
 a anterior, com o log do app na tela. No fim, o deploy acessa `https://dominio/HEALTH` de fora e
