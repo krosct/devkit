@@ -31,6 +31,12 @@ SHARED_DIR=/srv/caddy
 SHARED_CONF=/etc/caddy/Caddyfile
 SHARED_MARK_BASE="# devkit: camada compartilhada do Caddy"
 SHARED_MARK="$SHARED_MARK_BASE v2"
+# Portas do Caddy compartilhado no firewall da VPS. Regras do iptables/nftables que não foram
+# salvas somem num reinício: o serviço devkit-ports (do sistema) as recoloca a cada boot.
+WEB_PORTS="80 443"
+PORTS_LIB=/usr/local/lib/devkit
+PORTS_UNIT=/etc/systemd/system/devkit-ports.service
+PORTS_MARK="# devkit: portas do Caddy compartilhado v1"
 # Faixas do Cloudflare (https://www.cloudflare.com/ips/, conferidas em 2026-10-07). Só de dentro
 # delas o Caddy aceita o CF-Connecting-IP como IP do visitante; de qualquer outro lugar, o
 # cabeçalho é ignorado e não dá para falsificar o IP.
@@ -207,7 +213,8 @@ build_package() { # destino.tgz
 
 run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
-    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 missing k v preserve=0
+    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 want_ports=0 missing k v preserve=0
+    local root_msg="Preparando a VPS com root (só desta vez)"
     HOST=${1:-}
     if [ -z "$HOST" ] || [ "${HOST#-}" != "$HOST" ]; then die "informe o HOST da VPS: deploy.sh vps HOST [opções]"; fi
     [[ $HOST =~ ^[A-Za-z0-9@._:-]+$ ]] || die "HOST inválido: $HOST"
@@ -303,7 +310,11 @@ run_vps() {
         done
     fi
 
-    # Root só quando falta algo do sistema: a pasta, o linger ou a camada do Caddy.
+    # Root só quando falta algo do sistema: a pasta, o linger, a camada do Caddy ou, num app com
+    # site, as portas 80/443 no firewall (fechadas, ou sem o serviço que as libera a cada boot).
+    # Só as portas não param o deploy sem sudo: fica o aviso, e a conferência de fora no fim diz se
+    # o site responde.
+    if [ -n "$domain" ] && [ "$(pf PORTS)" != ok ]; then want_ports=1; fi
     if [ "$(pf ROOT_OK)" != yes ] || [ "$(pf LINGER)" != yes ] || [ "$want_caddy" = 1 ]; then
         need_root=1
         case $(pf SUDO) in
@@ -314,6 +325,17 @@ run_vps() {
                 sudo_mode="sudo" ;;
             *) die "a VPS precisa de uma preparação com root (pasta, linger ou Caddy) e o usuário $(pf USER) não tem sudo." ;;
         esac
+    elif [ "$want_ports" = 1 ]; then
+        case $(pf SUDO) in
+            nopasswd) need_root=1; sudo_mode="sudo -n" ;;
+            password) if interactive; then need_root=1; sudo_mode="sudo"; fi ;;
+        esac
+        if [ "$need_root" = 1 ]; then
+            root_msg="Firewall da VPS: $(pf PORTS_PROBLEM). Conferindo e liberando as portas 80/443 com root"
+        else
+            want_ports=0
+            warn "firewall da VPS: $(pf PORTS_PROBLEM). Liberar as portas 80/443 precisa de sudo: rode este deploy uma vez num terminal (ou dê sudo sem senha ao usuário $(pf USER))."
+        fi
     fi
 
     release=${DEVKIT_RELEASE:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo local)-$(date +%Y%m%d%H%M%S)}
@@ -337,11 +359,11 @@ run_vps() {
         die "não consegui enviar a versão para a VPS."
 
     if [ "$need_root" = 1 ]; then
-        log "Preparando a VPS com root (só desta vez)"
+        log "$root_msg"
         if [ "$sudo_mode" = sudo ]; then
-            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy"
+            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports"
         else
-            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy" </dev/null
+            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports" </dev/null
         fi || die "a preparação com root falhou (veja acima)."
     fi
 
@@ -605,6 +627,166 @@ setup_shared_caddy() { # usuário (como root)
     systemctl is-active --quiet caddy || die "o Caddy não iniciou: veja 'sudo journalctl -u caddy -n 30'."
 }
 
+# ---------- firewall: as portas 80/443 do Caddy compartilhado ----------
+# Só libera as portas num firewall que já está ativo (ufw, firewalld, iptables ou nftables): nunca
+# liga um firewall nem mexe em outras portas. Uma regra que já aceita a porta (mesmo só de algumas
+# origens, como as faixas do Cloudflare) é respeitada.
+
+# Comandos de /usr/sbin, que nem sempre está no PATH de quem não é root.
+has_cmd() { command -v "$1" >/dev/null 2>&1 || [ -x "/usr/sbin/$1" ] || [ -x "/sbin/$1" ]; }
+as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+firewall_kind() { # ufw, firewalld ou netfilter (iptables/nftables direto)
+    if has_cmd ufw && [[ $(as_root env LC_ALL=C ufw status 2>/dev/null || true) == "Status: active"* ]]; then echo ufw
+    elif has_cmd firewall-cmd && [ "$(as_root firewall-cmd --state 2>/dev/null || true)" = running ]; then echo firewalld
+    else echo netfilter; fi
+}
+
+ufw_closed() { # saída-do-"ufw status" porta: nenhuma regra ALLOW (de entrada) para a porta em tcp
+    awk -v p="$2" '{ sub(/ \(v6\)/, "") }
+        $2 == "ALLOW" && $3 != "OUT" && $3 != "FWD" {
+            n = split($1, a, "/"); if (n > 1 && a[2] != "tcp") next
+            n = split(a[1], ps, ","); for (i = 1; i <= n; i++) if (ps[i] == p) found = 1
+        }
+        END { exit found }' <<<"$1"
+}
+
+ipt_closed() { # saída-do-"iptables -S INPUT" porta: o INPUT bloqueia e não aceita a porta antes
+    awk -v p="$2" '
+        function has_port(s,   n, a, i) {
+            if (!match(s, /--dports? [0-9:,]+/)) return 0
+            s = substr(s, RSTART, RLENGTH); sub(/^--dports? /, "", s)
+            n = split(s, a, ","); for (i = 1; i <= n; i++) if (a[i] == p) return 1
+            return 0
+        }
+        /^-P INPUT DROP$/ { block = 1 }
+        /^-A INPUT / && !stop {
+            if (/ -j ACCEPT( |$)/ && / -p tcp / && has_port($0)) ok = 1
+            # Uma regra final sem filtro (ex.: a da Oracle Cloud) fecha todo o resto.
+            if (/^-A INPUT -j (DROP|REJECT)( |$)/) { block = 1; stop = 1 }
+        }
+        END { exit !(block && !ok) }' <<<"$1"
+}
+
+# Chains de entrada do nftables com política drop, fora das do iptables-nft (que se chamam INPUT e
+# ficam com o iptables): "família tabela chain" por linha.
+nft_input_chains() { # saída-do-"nft list ruleset"
+    awk '$1 == "table" { fam = $2; tab = $3 } $1 == "chain" { ch = $2 }
+        /hook input/ && /policy drop/ && ch != "INPUT" { print fam, tab, ch }' <<<"$1"
+}
+
+nft_accepts() { # saída-do-"nft list chain" porta
+    grep -qE "tcp dport (\{ )?([0-9]+, )*$2([ ,]|$).*accept" <<<"$1"
+}
+
+# check: imprime as portas fechadas (ex.: "iptables:80 iptables:443"; vazio = abertas).
+# open: libera as fechadas. Precisa de root ou de sudo sem senha.
+web_ports_firewall() { # check|open
+    local mode=$1 p c s rules fam tab ch closed=""
+    case $(firewall_kind) in
+        ufw)
+            rules=$(as_root env LC_ALL=C ufw status 2>/dev/null || true)
+            for p in $WEB_PORTS; do
+                ufw_closed "$rules" "$p" || continue
+                closed+="ufw:$p "
+                [ "$mode" = check ] || as_root ufw allow "$p/tcp" comment devkit >/dev/null ||
+                    die "não consegui liberar a porta $p no ufw."
+            done ;;
+        firewalld)
+            for p in $WEB_PORTS; do
+                if [ "$p" = 80 ]; then s=http; else s=https; fi
+                if as_root firewall-cmd --query-port="$p/tcp" >/dev/null 2>&1 ||
+                    as_root firewall-cmd --query-service="$s" >/dev/null 2>&1; then continue; fi
+                closed+="firewalld:$p "
+                [ "$mode" = check ] || { as_root firewall-cmd --permanent --add-port="$p/tcp" >/dev/null &&
+                    as_root firewall-cmd --add-port="$p/tcp" >/dev/null; } ||
+                    die "não consegui liberar a porta $p no firewalld."
+            done ;;
+        netfilter)
+            for c in iptables ip6tables; do
+                has_cmd "$c" || continue
+                rules=$(as_root "$c" -S INPUT 2>/dev/null) || continue
+                for p in $WEB_PORTS; do
+                    ipt_closed "$rules" "$p" || continue
+                    closed+="$c:$p "
+                    [ "$mode" = check ] || as_root "$c" -I INPUT -p tcp --dport "$p" -m comment --comment devkit -j ACCEPT ||
+                        die "não consegui liberar a porta $p no $c."
+                done
+            done
+            if has_cmd nft && rules=$(as_root nft -n list ruleset 2>/dev/null); then
+                while read -r fam tab ch; do
+                    s=$(as_root nft -n list chain "$fam" "$tab" "$ch" 2>/dev/null) || continue
+                    for p in $WEB_PORTS; do
+                        nft_accepts "$s" "$p" && continue
+                        closed+="nftables:$p "
+                        [ "$mode" = check ] || as_root nft insert rule "$fam" "$tab" "$ch" tcp dport "$p" accept comment '"devkit"' ||
+                            die "não consegui liberar a porta $p no nftables ($fam $tab $ch)."
+                    done
+                done < <(nft_input_chains "$rules")
+            fi ;;
+    esac
+    printf '%s' "${closed% }"
+}
+
+open_web_ports() { # como root
+    local opened left
+    opened=$(web_ports_firewall open)
+    [ -z "$opened" ] || log "Firewall da VPS: liberadas as portas do Caddy ($opened)"
+    left=$(web_ports_firewall check)
+    [ -z "$left" ] || die "o firewall da VPS continua fechado para o Caddy: $left."
+}
+
+# O serviço devkit-ports libera as portas a cada boot, depois que o firewall carrega as regras
+# salvas. O script dele fica numa pasta de root (o usuário do deploy não pode trocá-lo).
+setup_ports_guard() { # como root
+    local unit
+    unit="$PORTS_MARK
+# Gerado pelo devkit. Não edite: é sobrescrito pelo deploy.
+[Unit]
+Description=devkit: portas 80/443 do Caddy compartilhado no firewall
+After=network-pre.target ufw.service firewalld.service netfilter-persistent.service nftables.service iptables.service ip6tables.service
+Before=caddy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $PORTS_LIB/deploy.sh _open-ports
+
+[Install]
+WantedBy=multi-user.target"
+    install -d -o root -g root -m 755 "$PORTS_LIB"
+    install -o root -g root -m 755 "$DEVKIT_DIR/deploy.sh" "$PORTS_LIB/deploy.sh"
+    if [ "$(cat "$PORTS_UNIT" 2>/dev/null || true)" != "$unit" ]; then
+        printf '%s\n' "$unit" > "$PORTS_UNIT"
+        chmod 644 "$PORTS_UNIT"
+        systemctl daemon-reload
+        log "Serviço devkit-ports instalado (libera as portas 80/443 a cada boot)"
+    fi
+    systemctl enable --quiet devkit-ports
+    open_web_ports
+    # Roda de novo pelo serviço (já sem nada a fazer) para que o estado dele mostre que deu certo.
+    if ! systemctl restart devkit-ports; then
+        journalctl -u devkit-ports -n 20 --no-pager -o cat >&2 || true
+        die "o serviço devkit-ports falhou (veja acima)."
+    fi
+}
+
+# "ok" ou o problema. Sem root, confia no serviço devkit-ports (o estado dele qualquer um lê).
+ports_state() {
+    local closed
+    if ! grep -qxF "$PORTS_MARK" "$PORTS_UNIT" 2>/dev/null; then
+        echo "o serviço devkit-ports (libera as portas a cada boot) não está instalado"; return
+    fi
+    if ! systemctl is-enabled --quiet devkit-ports 2>/dev/null || ! systemctl is-active --quiet devkit-ports 2>/dev/null; then
+        echo "o serviço devkit-ports não rodou ou falhou ('sudo journalctl -u devkit-ports')"; return
+    fi
+    if [ "$(id -u)" = 0 ] || can_sudo; then
+        closed=$(web_ports_firewall check)
+        if [ -n "$closed" ]; then echo "portas fechadas no firewall da VPS: $closed"; return; fi
+    fi
+    echo ok
+}
+
 # ---------- _preflight: o estado da VPS para o "vps" decidir (sem root, sem alterar nada) ----------
 
 remote_preflight() { # app pasta obrigatórias...
@@ -642,16 +824,18 @@ remote_preflight() { # app pasta obrigatórias...
         *) echo "LAYER=$layer" ;;
     esac
     if linger_on "$me"; then echo LINGER=yes; else echo LINGER=no; fi
+    state=$(ports_state)
+    if [ "$state" = ok ]; then echo PORTS=ok; else echo PORTS=setup; echo "PORTS_PROBLEM=$state"; fi
     if can_sudo; then echo SUDO=nopasswd
     elif command -v sudo >/dev/null 2>&1 && id -nG "$me" | grep -qwE 'sudo|wheel|admin'; then echo SUDO=password
     else echo SUDO=none; fi
     [ -d /run/systemd/system ] || echo "ROOT_PROBLEM=a VPS não usa systemd; o devkit precisa dele."
 }
 
-# ---------- _root-setup: o que só root faz (pasta, linger, camada do Caddy) ----------
+# ---------- _root-setup: o que só root faz (pasta, linger, camada do Caddy, firewall) ----------
 
-remote_root_setup() { # app pasta usuário quer-caddy
-    local app=$1 root=$2 user=$3 want_caddy=$4
+remote_root_setup() { # app pasta usuário quer-caddy quer-portas
+    local app=$1 root=$2 user=$3 want_caddy=$4 want_ports=$5
     [ "$(id -u)" = 0 ] || die "a preparação precisa de root."
     if ! [[ $app =~ $APP_RE ]] || ! [[ $user =~ ^[a-z_][a-z0-9_-]*$ ]] || ! id "$user" >/dev/null 2>&1; then
         die "app ou usuário inválido."
@@ -667,6 +851,7 @@ remote_root_setup() { # app pasta usuário quer-caddy
         log "Linger ativado para $user (os apps continuam rodando sem sessão aberta)"
     fi
     [ "$want_caddy" != 1 ] || setup_shared_caddy "$user"
+    [ "$want_ports" != 1 ] || setup_ports_guard
 }
 
 # ---------- _release-up: instala e ativa a versão (como o usuário do SSH) ----------
@@ -783,10 +968,10 @@ public_problem() { # url-de-saúde -> imprime o problema (vazio = respondeu 200)
         sleep 5
     done
     case $code in
-        000 | "") echo "sem resposta. O domínio existe no DNS e aponta para esta VPS? As portas 80/443 estão abertas?" ;;
+        000 | "") echo "sem resposta. O domínio existe no DNS e aponta para esta VPS? O firewall do provedor (security group / security list) libera as portas 80/443?" ;;
         525 | 526) cert_advice "$code" ;;
         403) echo "bloqueado com 403 (no Cloudflare, é a proteção contra bots ou uma regra do WAF barrando a conferência)." ;;
-        52[0-4]) echo "o Cloudflare não conseguiu falar com a VPS (erro $code). As portas 80/443 estão abertas para ele?" ;;
+        52[0-4]) echo "o Cloudflare não conseguiu falar com a VPS (erro $code). O firewall do provedor (security group / security list) libera as portas 80/443?" ;;
         *) echo "$1 respondeu $code em vez de 200." ;;
     esac
 }
@@ -1082,7 +1267,8 @@ main() {
         ci) run_ci ;;
         status | logs | restart | stop) run_helper "$1" "${2:-}" ;;
         _preflight) shift; remote_preflight "$@" ;;
-        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+        _open-ports) [ "$(id -u)" = 0 ] || die "_open-ports precisa de root."; open_web_ports ;;
         _release-up) remote_release_up "${2:-}" "${3:-}" "${4:-}" ;;
         -h | --help | help | "") usage 0 ;;
         *) usage 1 ;;
