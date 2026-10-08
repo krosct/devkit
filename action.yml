@@ -36,6 +36,10 @@ inputs:
     description: chave privada do Certificado de Origem (PEM), opcional
     required: false
     default: ''
+  no-preserve:
+    description: "'true' gera de novo as chaves PRESERVE que não vierem dos secrets"
+    required: false
+    default: 'false'
   secrets:
     description: 'passe toJSON(secrets) do workflow: de onde saem as chaves ENV do deploy.conf'
     required: true
@@ -59,6 +63,7 @@ runs:
         DEVKIT_DOMAIN: ${{ inputs.domain }}
         DEVKIT_ORIGIN_CERT: ${{ inputs.origin-cert }}
         DEVKIT_ORIGIN_KEY: ${{ inputs.origin-key }}
+        DEVKIT_NO_PRESERVE: ${{ inputs.no-preserve }}
         DEVKIT_SECRETS: ${{ inputs.secrets }}
         DEVKIT_VARS: ${{ inputs.vars }}
       run: '"$GITHUB_ACTION_PATH/deploy.sh" ci'

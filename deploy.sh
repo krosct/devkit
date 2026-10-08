@@ -10,6 +10,7 @@
 #     --cert ARQUIVO --key ARQUIVO   Certificado de Origem do Cloudflare (SSL "Full (strict)")
 #     --env ARQUIVO                  substitui a configuração do app na VPS por este arquivo
 #     --path PASTA                   pasta do app na VPS (padrão: /srv/<app>)
+#     --no-preserve                  gera de novo as chaves PRESERVE que não vierem na configuração
 #   deploy.sh status|logs|restart|stop HOST
 #
 # O que faltar (configuração obrigatória, domínio, certificado, senha do sudo) é perguntado no
@@ -26,7 +27,12 @@ HEALTH_SECONDS=15
 # Camada compartilhada do Caddy: um Caddy para todos os apps da VPS, de nenhum deles.
 SHARED_DIR=/srv/caddy
 SHARED_CONF=/etc/caddy/Caddyfile
-SHARED_MARK="# devkit: camada compartilhada do Caddy v1"
+SHARED_MARK_BASE="# devkit: camada compartilhada do Caddy"
+SHARED_MARK="$SHARED_MARK_BASE v2"
+# Faixas do Cloudflare (https://www.cloudflare.com/ips/, conferidas em 2026-10-07). Só de dentro
+# delas o Caddy aceita o CF-Connecting-IP como IP do visitante; de qualquer outro lugar, o
+# cabeçalho é ignorado e não dá para falsificar o IP.
+CLOUDFLARE_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
 # Porta interna de cada app (só 127.0.0.1), escolhida no 1º deploy e mantida depois.
 PORT_MIN=20000
 PORT_MAX=29999
@@ -55,6 +61,7 @@ kv_set() { # arquivo chave valor (substitui a linha, mantendo as permissões do 
 }
 
 file_hash() { sha256sum "$1" | cut -d' ' -f1; }
+random_secret() { od -An -N24 -tx1 /dev/urandom | tr -d ' \n'; }
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 normalize_domain() { # "https://x.com/" -> "x.com"; vazio se inválido
@@ -170,7 +177,7 @@ build_package() { # destino.tgz
 
 run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
-    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 env_mode="" missing k v
+    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 env_mode="" missing k v no_preserve=0
     HOST=${1:-}
     [ -n "$HOST" ] && [ "${HOST#-}" = "$HOST" ] || die "informe o HOST da VPS: deploy.sh vps HOST [opções]"
     [[ $HOST =~ ^[A-Za-z0-9@._:-]+$ ]] || die "HOST inválido: $HOST"
@@ -183,6 +190,7 @@ run_vps() {
             --key) key=${2:-}; shift 2 ;;
             --env) env_opt=${2:-}; shift 2 ;;
             --path) path=${2:-}; shift 2 ;;
+            --no-preserve) no_preserve=1; shift ;;
             *) die "opção desconhecida: $1 (veja: deploy.sh help)" ;;
         esac
     done
@@ -292,6 +300,7 @@ run_vps() {
     cp "$DEVKIT_DIR/deploy.sh" "$bundle/deploy.sh"
     printf '%s\n' "$domain" > "$bundle/inputs/domain"
     [ -z "$cert_mode" ] || printf '%s\n' "$cert_mode" > "$bundle/inputs/cert-mode"
+    [ "$no_preserve" = 0 ] || : > "$bundle/inputs/no-preserve"
     if [ -n "$cert" ]; then cp "$cert" "$bundle/inputs/cert.pem"; cp "$key" "$bundle/inputs/cert.key"; fi
     if [ "$env_mode" = replace ]; then cp "$env_opt" "$bundle/inputs/env"; fi
     [ ! -s "$WORK/env-add" ] || cp "$WORK/env-add" "$bundle/inputs/env-add"
@@ -352,6 +361,7 @@ for item in os.environ["DEVKIT_ENV_KEYS"].split():
     args=(--env "$WORK/ci.env")
     [ -z "${DEVKIT_PATH:-}" ] || args+=(--path "$(tr -d '[:space:]' <<<"$DEVKIT_PATH")")
     [ -z "${DEVKIT_DOMAIN:-}" ] || args+=(--domain "$(tr -d '[:space:]' <<<"$DEVKIT_DOMAIN")")
+    [ "${DEVKIT_NO_PRESERVE:-false}" != true ] || args+=(--no-preserve)
     if [ -n "${DEVKIT_ORIGIN_CERT:-}${DEVKIT_ORIGIN_KEY:-}" ]; then
         (umask 077 && printf '%s\n' "${DEVKIT_ORIGIN_CERT:-}" > "$WORK/origin.pem" && printf '%s\n' "${DEVKIT_ORIGIN_KEY:-}" > "$WORK/origin.key")
         args+=(--cert "$WORK/origin.pem" --key "$WORK/origin.key")
@@ -417,10 +427,20 @@ linger_on() { [ "$(loginctl show-user "$1" -p Linger --value 2>/dev/null || echo
 # erro com o motivo.
 
 shared_caddyfile() { # pasta-dos-sites
-    printf '%s\n' "$SHARED_MARK" \
-        "# Não pertence a nenhum app e não deve ser editado: cada app publica o próprio site em" \
-        "# $SHARED_DIR/sites/<app>.caddy pelo devkit." \
-        "import $1/*.caddy"
+    cat <<EOF
+$SHARED_MARK
+# Não pertence a nenhum app e não deve ser editado: cada app publica o próprio site em
+# $SHARED_DIR/sites/<app>.caddy pelo devkit.
+{
+	servers {
+		# Atrás do Cloudflare, o IP do visitante vem no CF-Connecting-IP (só aceito das faixas dele).
+		trusted_proxies static $CLOUDFLARE_RANGES
+		client_ip_headers CF-Connecting-IP X-Forwarded-For
+	}
+}
+
+import $1/*.caddy
+EOF
 }
 
 # Caddys rodando, fora de containers: "pid usuário config" por linha.
@@ -447,14 +467,16 @@ web_ports_busy() {
 layer_state() {
     local procs line busy
     procs=$(caddy_processes)
-    if grep -qxF "$SHARED_MARK" "$SHARED_CONF" 2>/dev/null; then
+    if grep -q "^$SHARED_MARK_BASE" "$SHARED_CONF" 2>/dev/null; then
         while IFS= read -r line; do
             if [ -n "$line" ] && [ "${line##* }" != "$SHARED_CONF" ]; then
                 echo "conflict: além da camada compartilhada, há outro Caddy rodando (pid usuário config: $line). Pare-o e rode de novo."
                 return
             fi
         done <<<"$procs"
-        if command -v caddy >/dev/null && [ -w "$SHARED_DIR/sites" ] && [ -w "$SHARED_DIR/certs" ] &&
+        # Uma camada de versão anterior também é "setup": a preparação com root a atualiza.
+        if grep -qxF "$SHARED_MARK" "$SHARED_CONF" && command -v caddy >/dev/null &&
+            [ -w "$SHARED_DIR/sites" ] && [ -w "$SHARED_DIR/certs" ] &&
             systemctl is-active --quiet caddy 2>/dev/null; then echo ok; else echo setup; fi
         return
     fi
@@ -493,9 +515,13 @@ setup_shared_caddy() { # usuário (como root)
     local state d
     state=$(layer_state)
     case $state in conflict:*) die "${state#conflict: }" ;; esac
-    if ! grep -qxF "$SHARED_MARK" "$SHARED_CONF" 2>/dev/null; then
+    if ! grep -q "^$SHARED_MARK_BASE" "$SHARED_CONF" 2>/dev/null; then
         log "Criando a camada compartilhada do Caddy ($SHARED_CONF → $SHARED_DIR/sites/)"
-        # Antes do pacote: uma instalação interrompida é retomada no próximo deploy.
+    elif ! grep -qxF "$SHARED_MARK" "$SHARED_CONF"; then
+        log "Atualizando a camada compartilhada do Caddy ($SHARED_MARK)"
+    fi
+    # Antes do pacote: uma instalação interrompida é retomada no próximo deploy.
+    if ! grep -qxF "$SHARED_MARK" "$SHARED_CONF" 2>/dev/null; then
         mkdir -p "$(dirname "$SHARED_CONF")"
         shared_caddyfile "$SHARED_DIR/sites" > "$SHARED_CONF"
         chmod 644 "$SHARED_CONF"
@@ -513,7 +539,8 @@ setup_shared_caddy() { # usuário (como root)
         die "$SHARED_DIR pertence a outro usuário ($(stat -c %U "$SHARED_DIR")): todos os apps devem usar o mesmo usuário do SSH."
     fi
     systemctl enable --now caddy >/dev/null 2>&1 || true
-    systemctl restart caddy >/dev/null 2>&1 || true
+    # Reload, quando possível: os sites dos outros apps não caem.
+    systemctl reload-or-restart caddy >/dev/null 2>&1 || true
     systemctl is-active --quiet caddy || die "o Caddy não iniciou: veja 'sudo journalctl -u caddy -n 30'."
 }
 
@@ -591,8 +618,18 @@ site_block() { # domínio porta
     if [ -f "$(cert_base).pem" ] && [ -f "$(cert_base).key" ]; then
         tls=$(printf '\n\ttls %s.pem %s.key' "$(cert_base)" "$(cert_base)")
     fi
-    printf '# Gerado pelo devkit para o %s. Não edite: é sobrescrito a cada deploy.\n' "$APP"
-    printf '%s {\n\treverse_proxy 127.0.0.1:%s%s\n}\n' "$1" "$2" "$tls"
+    # O app recebe o IP real do visitante em X-Forwarded-For e X-Real-IP (o {client_ip} do Caddy,
+    # que atrás do Cloudflare é o CF-Connecting-IP); respostas comprimidas com zstd ou gzip.
+    cat <<EOF
+# Gerado pelo devkit para o $APP. Não edite: é sobrescrito a cada deploy.
+$1 {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:$2 {
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Real-IP {client_ip}
+	}$tls
+}
+EOF
 }
 
 # Testa a configuração inteira: os sites dos outros apps mais o deste (novo, ou removido com "").
@@ -820,6 +857,26 @@ prune_releases() {
         done
 }
 
+# PRESERVE: chaves que sobrevivem aos deploys (ex.: um salt). Um valor novo e explícito vence;
+# sem ele, fica o da VPS; sem nenhum (ou com --no-preserve), um aleatório é gerado.
+apply_preserve() { # deploy.conf entradas env-novo env-atual
+    local k kept preserve=()
+    read -r -a preserve <<<"$(kv_get "$1" PRESERVE)"
+    [ ! -f "$2/no-preserve" ] || log "--no-preserve: as chaves PRESERVE sem valor novo serão geradas de novo"
+    for k in "${preserve[@]}"; do
+        [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "deploy.conf: PRESERVE inválido: $k"
+        [ -z "$(kv_get "$2/env-add" "$k")$(kv_get "$2/env" "$k")" ] || continue
+        kept=""
+        [ -f "$2/no-preserve" ] || kept=$(kv_get "$4" "$k")
+        if [ -n "$kept" ]; then
+            kv_set "$3" "$k" "$kept"
+        else
+            kv_set "$3" "$k" "$(random_secret)"
+            log "Gerado um valor aleatório para $k (fica guardado para os próximos deploys)"
+        fi
+    done
+}
+
 remote_release_up() { # app pasta versão
     local release=$3 inputs="$DEVKIT_DIR/inputs" code staged="" previous problem k missing
     APP=$1 ROOT=$2
@@ -854,6 +911,7 @@ remote_release_up() { # app pasta versão
             [ -n "$k" ] && kv_set "$ROOT/.devkit/env.new" "${k%%=*}" "${k#*=}"
         done < "$inputs/env-add"
     fi
+    apply_preserve "$code/deploy.conf" "$inputs" "$ROOT/.devkit/env.new" "$ROOT/.env"
     missing=""
     for k in $(kv_get "$code/deploy.conf" REQUIRED); do
         [ -n "$(kv_get "$ROOT/.devkit/env.new" "$k")" ] || missing+="$k "
