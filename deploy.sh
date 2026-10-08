@@ -8,9 +8,11 @@
 #     --domain DOMINIO               endereço público (padrão: o que a VPS já usa para o app)
 #     --no-domain                    sem endereço público (o site do app sai do Caddy)
 #     --cert ARQUIVO --key ARQUIVO   Certificado de Origem do Cloudflare (SSL "Full (strict)")
-#     --env ARQUIVO                  substitui a configuração do app na VPS por este arquivo
+#     --env ARQUIVO                  envia a configuração deste arquivo: cada chave dele substitui a
+#                                    da VPS (vazia = removida); as outras chaves da VPS ficam
+#     --preserve                     com --env: o que a VPS já tem com valor fica; o enviado só
+#                                    preenche o que falta ou está vazio
 #     --path PASTA                   pasta do app na VPS (padrão: /srv/<app>)
-#     --no-preserve                  gera de novo as chaves PRESERVE que não vierem na configuração
 #   deploy.sh status|logs|restart|stop HOST
 #
 # O que faltar (configuração obrigatória, domínio, certificado, senha do sudo) é perguntado no
@@ -46,10 +48,12 @@ warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merro:\033[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$DEVKIT_DIR/deploy.sh" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
-# Lê CHAVE=valor de um .env/.conf sem executá-lo (aspas externas são removidas).
+# Valor de um .env sem espaços no fim e sem aspas externas (filtro).
+unquote() { sed -E "s/[[:space:]]+\$//; s/^\"(.*)\"\$/\\1/; s/^'(.*)'\$/\\1/"; }
+
+# Lê CHAVE=valor de um .env/.conf sem executá-lo.
 kv_get() { # arquivo chave
-    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null | tail -n1 |
-        sed -E "s/[[:space:]]+\$//; s/^\"(.*)\"\$/\\1/; s/^'(.*)'\$/\\1/"
+    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null | tail -n1 | unquote
 }
 
 kv_set() { # arquivo chave valor (substitui a linha, mantendo as permissões do arquivo)
@@ -59,6 +63,16 @@ kv_set() { # arquivo chave valor (substitui a linha, mantendo as permissões do 
     cat "$tmp" > "$1"
     rm -f "${tmp:?}"
 }
+
+kv_unset() { # arquivo chave (remove a linha, mantendo as permissões do arquivo)
+    local tmp
+    tmp=$(mktemp)
+    { grep -v "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null || true; } > "$tmp"
+    cat "$tmp" > "$1"
+    rm -f "${tmp:?}"
+}
+
+kv_has() { grep -qE "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null; } # arquivo chave
 
 file_hash() { sha256sum "$1" | cut -d' ' -f1; }
 random_secret() { od -An -N24 -tx1 /dev/urandom | tr -d ' \n'; }
@@ -157,6 +171,22 @@ run_local() {
 
 # ---------- vps: tudo até a VPS funcionar ----------
 
+# Obrigatórias que ficariam vazias depois de aplicar o enviado sobre a configuração da VPS (as
+# mesmas regras de merge_env, com o que o _preflight conta da VPS).
+missing_after_merge() { # arquivo-enviado(ou "") preserva(0/1)
+    local k sent present vps_has
+    for k in $(conf REQUIRED); do
+        [[ " $(conf PRESERVE) " != *" $k "* ]] || continue
+        sent="" present=0
+        if [ -n "$1" ] && kv_has "$1" "$k"; then present=1; sent=$(kv_get "$1" "$k"); fi
+        [ -z "$sent" ] || continue
+        vps_has=0
+        if [ "$(pf ENV_EXISTS)" = yes ] && [[ " $(pf ENV_MISSING) " != *" $k "* ]]; then vps_has=1; fi
+        if [ "$vps_has" = 1 ] && { [ "$2" = 1 ] || [ "$present" = 0 ]; }; then continue; fi
+        printf '%s ' "$k"
+    done
+}
+
 ssh_host() { ssh -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST" "$@"; }
 
 build_package() { # destino.tgz
@@ -177,7 +207,7 @@ build_package() { # destino.tgz
 
 run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
-    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 env_mode="" missing k v no_preserve=0
+    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 missing k v preserve=0
     HOST=${1:-}
     if [ -z "$HOST" ] || [ "${HOST#-}" != "$HOST" ]; then die "informe o HOST da VPS: deploy.sh vps HOST [opções]"; fi
     [[ $HOST =~ ^[A-Za-z0-9@._:-]+$ ]] || die "HOST inválido: $HOST"
@@ -190,7 +220,7 @@ run_vps() {
             --key) key=${2:-}; shift 2 ;;
             --env) env_opt=${2:-}; shift 2 ;;
             --path) path=${2:-}; shift 2 ;;
-            --no-preserve) no_preserve=1; shift ;;
+            --preserve) preserve=1; shift ;;
             *) die "opção desconhecida: $1 (veja: deploy.sh help)" ;;
         esac
     done
@@ -246,25 +276,13 @@ run_vps() {
         fi
     fi
 
-    # Configuração do app: a do --env substitui a da VPS; sem ele, a da VPS é mantida e só o que
-    # falta é perguntado.
+    # Configuração do app: a enviada (--env ou, no 1º deploy, o .env do projeto) é aplicada sobre
+    # a da VPS chave a chave (veja merge_env); sem ela, a da VPS fica como está. O que for
+    # obrigatório e ficar vazio é perguntado.
     : > "$WORK/env-add"
     if [ -n "$env_opt" ]; then
         [ -f "$env_opt" ] || die "--env: $env_opt não existe."
-        fill_required "$env_opt"
-        env_mode=replace
-    elif [ "$(pf ENV_EXISTS)" = yes ]; then
-        missing=$(pf ENV_MISSING)
-        if [ -n "$missing" ]; then
-            interactive || die "faltam na configuração do $APP na VPS: $missing"
-            log "Faltam configurações obrigatórias do $APP na VPS:"
-            for k in $missing; do
-                v=""
-                while [ -z "$v" ]; do v=$(ask_secret "  $k:"); done
-                printf '%s=%s\n' "$k" "$v" >> "$WORK/env-add"
-            done
-        fi
-    else
+    elif [ "$(pf ENV_EXISTS)" != yes ]; then
         interactive || die "a VPS ainda não tem a configuração do $APP: passe --env ARQUIVO."
         env_opt="$WORK/env-new"
         if [ -f "$PWD/.env" ] && yes_no "A VPS ainda não tem a configuração do $APP. Usar o $PWD/.env?"; then
@@ -272,8 +290,17 @@ run_vps() {
         else
             : > "$env_opt"
         fi
-        fill_required "$env_opt"
-        env_mode=replace
+    fi
+    [ "$preserve" = 0 ] || [ -n "$env_opt" ] || warn "--preserve sem --env: nada é enviado, a configuração da VPS fica como está."
+    missing=$(missing_after_merge "$env_opt" "$preserve")
+    if [ -n "$missing" ]; then
+        interactive || die "faltam na configuração do $APP: $missing"
+        log "Faltam configurações obrigatórias do $APP:"
+        for k in $missing; do
+            v=""
+            while [ -z "$v" ]; do v=$(ask_secret "  $k:"); done
+            printf '%s=%s\n' "$k" "$v" >> "$WORK/env-add"
+        done
     fi
 
     # Root só quando falta algo do sistema: a pasta, o linger ou a camada do Caddy.
@@ -300,9 +327,9 @@ run_vps() {
     cp "$DEVKIT_DIR/deploy.sh" "$bundle/deploy.sh"
     printf '%s\n' "$domain" > "$bundle/inputs/domain"
     [ -z "$cert_mode" ] || printf '%s\n' "$cert_mode" > "$bundle/inputs/cert-mode"
-    [ "$no_preserve" = 0 ] || : > "$bundle/inputs/no-preserve"
+    [ "$preserve" = 0 ] || : > "$bundle/inputs/preserve"
     if [ -n "$cert" ]; then cp "$cert" "$bundle/inputs/cert.pem"; cp "$key" "$bundle/inputs/cert.key"; fi
-    if [ "$env_mode" = replace ]; then cp "$env_opt" "$bundle/inputs/env"; fi
+    [ -z "$env_opt" ] || cp "$env_opt" "$bundle/inputs/env"
     [ ! -s "$WORK/env-add" ] || cp "$WORK/env-add" "$bundle/inputs/env-add"
     chmod -R go-rwx "$bundle"
     log "Enviando a versão $release"
@@ -322,11 +349,42 @@ run_vps() {
 }
 
 # ---------- ci: chamado pela action do GitHub (action.yml) ----------
-# Monta o acesso SSH, a configuração do app (das chaves ENV do deploy.conf, lidas dos secrets e
-# variables) e o certificado, e chama o mesmo "vps". Sem terminal: nada é perguntado.
+# Monta o acesso SSH, a configuração do app (da entrada "env" da action) e o certificado, e chama
+# o mesmo "vps". Sem terminal: nada é perguntado.
+
+# Entrada "env" da action -> arquivo CHAVE=valor. Uma linha por configuração; linhas em branco e
+# comentários (#) são ignorados. O conteúdo nunca vai para o log, só o número da linha.
+ci_env_file() { # texto
+    local line n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] ||
+            die "entrada env da action, linha $n: use CHAVE=valor (um valor com quebra de linha não é aceito)."
+        printf '%s=%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    done <<<"$1"
+}
+
+# Formato antigo (obsoleto, mantido para os projetos que ainda não migraram): ENV no deploy.conf
+# e toJSON(secrets)/toJSON(vars) na action. Cada chave vem do secret (ou variable) de mesmo nome,
+# ou do indicado depois do "="; as que não existem vão vazias (o app volta ao padrão).
+ci_env_legacy() {
+    DEVKIT_ENV_KEYS=$(conf ENV) python3 -I -c '
+import json, os, sys
+secrets = json.loads(os.environ.get("DEVKIT_SECRETS") or "{}")
+variables = json.loads(os.environ.get("DEVKIT_VARS") or "{}")
+for item in os.environ["DEVKIT_ENV_KEYS"].split():
+    key, _, source = item.partition("=")
+    value = (secrets.get(source or key) or variables.get(source or key) or "").strip()
+    if "\n" in value:
+        sys.exit(f"erro: {source or key} tem mais de uma linha")
+    print(f"{key}={value}")
+'
+}
 
 run_ci() {
-    local host user port args=()
+    local host user port k args=()
     load_conf
     host=$(tr -d '[:space:]' <<<"${DEVKIT_HOST:-}")
     user=$(tr -d '[:space:]' <<<"${DEVKIT_USER:-}")
@@ -345,25 +403,26 @@ run_ci() {
          "  IdentityFile ~/.ssh/devkit_vps" "  IdentitiesOnly yes" "  StrictHostKeyChecking yes" \
          "  BatchMode yes" > ~/.ssh/config)
 
-    # ENV="CHAVE CHAVE=SECRET ...": cada chave vem do secret (ou variable) de mesmo nome, ou do
-    # indicado depois do "=" (o GitHub não aceita secrets começando com GITHUB_).
-    (umask 077 && DEVKIT_ENV_KEYS=$(conf ENV) python3 -I -c '
-import json, os, sys
-secrets = json.loads(os.environ.get("DEVKIT_SECRETS") or "{}")
-variables = json.loads(os.environ.get("DEVKIT_VARS") or "{}")
-for item in os.environ["DEVKIT_ENV_KEYS"].split():
-    key, _, source = item.partition("=")
-    value = (secrets.get(source or key) or variables.get(source or key) or "").strip()
-    if "\n" in value:
-        sys.exit(f"erro: {source or key} tem mais de uma linha")
-    if value:
-        print(f"{key}={value}")
-' > "$WORK/ci.env") || die "não consegui montar a configuração a partir dos secrets."
-    log "Configuração com: $(cut -d= -f1 "$WORK/ci.env" | tr '\n' ' ')"
-    args=(--env "$WORK/ci.env")
+    # Configuração do app: a entrada "env" (no workflow: CHAVE=${{ secrets.X || vars.X }}).
+    : > "$WORK/ci.env"
+    if [ -n "${DEVKIT_ENV:-}" ]; then
+        [ -z "$(conf ENV)" ] || warn "deploy.conf: ENV é ignorado quando a action recebe a entrada env (pode removê-lo)."
+        ci_env_file "$DEVKIT_ENV" > "$WORK/ci.env"
+    elif [ -n "$(conf ENV)" ] && [ -n "${DEVKIT_SECRETS:-}" ] && [ "$DEVKIT_SECRETS" != "{}" ]; then
+        warn "obsoleto: ENV no deploy.conf com toJSON(secrets) na action. Passe a configuração pela entrada env (veja o README do devkit)."
+        ci_env_legacy > "$WORK/ci.env" || die "não consegui montar a configuração a partir dos secrets."
+    fi
+    if [ -s "$WORK/ci.env" ]; then
+        log "Configuração enviada: $(sed -n 's/^\([^=]*\)=..*/\1/p' "$WORK/ci.env" | tr '\n' ' ')"
+        k=$(sed -n 's/^\([^=]*\)=$/\1/p' "$WORK/ci.env" | tr '\n' ' ')
+        [ -z "$k" ] || log "  sem valor (removidas da VPS; o app usa o padrão): $k"
+        args=(--env "$WORK/ci.env")
+    else
+        log "Nenhuma configuração enviada: a da VPS fica como está."
+    fi
     [ -z "${DEVKIT_PATH:-}" ] || args+=(--path "$(tr -d '[:space:]' <<<"$DEVKIT_PATH")")
     [ -z "${DEVKIT_DOMAIN:-}" ] || args+=(--domain "$(tr -d '[:space:]' <<<"$DEVKIT_DOMAIN")")
-    [ "${DEVKIT_NO_PRESERVE:-false}" != true ] || args+=(--no-preserve)
+    if [ "$(tr -d '[:space:]' <<<"${DEVKIT_PRESERVE:-}" | tr '[:upper:]' '[:lower:]')" = true ]; then args+=(--preserve); fi
     if [ -n "${DEVKIT_ORIGIN_CERT:-}${DEVKIT_ORIGIN_KEY:-}" ]; then
         (umask 077 && printf '%s\n' "${DEVKIT_ORIGIN_CERT:-}" > "$WORK/origin.pem" && printf '%s\n' "${DEVKIT_ORIGIN_KEY:-}" > "$WORK/origin.key")
         args+=(--cert "$WORK/origin.pem" --key "$WORK/origin.key")
@@ -859,24 +918,59 @@ prune_releases() {
         done
 }
 
-# PRESERVE: chaves que sobrevivem aos deploys (ex.: um salt). Um valor novo e explícito vence;
-# sem ele, fica o da VPS; sem nenhum (ou com --no-preserve), um aleatório é gerado.
-apply_preserve() { # deploy.conf entradas env-novo env-atual
-    local k kept preserve=()
+# Aplica a configuração enviada sobre a da VPS, chave a chave. Por padrão, o valor enviado vence
+# e um valor vazio remove a chave (o app volta ao padrão dele); as chaves que não foram enviadas
+# ficam como estão. Com --preserve, um valor que a VPS já tem fica, e o enviado só preenche o que
+# falta ou está vazio. Uma chave PRESERVE enviada vazia é ignorada (a VPS mantém ou gera a dela).
+merge_env() { # enviado destino preserva(0/1) chaves-PRESERVE
+    local line k v
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        k=${BASH_REMATCH[1]}
+        v=${BASH_REMATCH[2]}
+        v=${v%"${v##*[![:space:]]}"}
+        if [ "$3" = 1 ] && [ -n "$(kv_get "$2" "$k")" ]; then continue; fi
+        if [ -n "$(printf '%s\n' "$v" | unquote)" ]; then
+            kv_set "$2" "$k" "$v"
+        elif [[ " $4 " != *" $k "* ]]; then
+            kv_unset "$2" "$k"
+        fi
+    done < "$1"
+}
+
+# PRESERVE: chaves que o servidor gera uma vez e guarda (ex.: um salt). Uma que ficou sem valor
+# depois de aplicar o enviado ganha um valor aleatório; nos deploys seguintes, ele fica.
+apply_preserve() { # deploy.conf env-novo
+    local k preserve=()
     read -r -a preserve <<<"$(kv_get "$1" PRESERVE)"
-    [ ! -f "$2/no-preserve" ] || log "--no-preserve: as chaves PRESERVE sem valor novo serão geradas de novo"
     for k in "${preserve[@]}"; do
         [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "deploy.conf: PRESERVE inválido: $k"
-        [ -z "$(kv_get "$2/env-add" "$k")$(kv_get "$2/env" "$k")" ] || continue
-        kept=""
-        [ -f "$2/no-preserve" ] || kept=$(kv_get "$4" "$k")
-        if [ -n "$kept" ]; then
-            kv_set "$3" "$k" "$kept"
-        else
-            kv_set "$3" "$k" "$(random_secret)"
-            log "Gerado um valor aleatório para $k (fica guardado para os próximos deploys)"
-        fi
+        [ -z "$(kv_get "$2" "$k")" ] || continue
+        kv_set "$2" "$k" "$(random_secret)"
+        log "Gerado um valor aleatório para $k (fica guardado para os próximos deploys)"
     done
+}
+
+# A configuração nova em .devkit/env.new (trocada só na ativação): a atual da VPS, com o enviado
+# aplicado (merge_env), as respostas do terminal e as chaves PRESERVE.
+prepare_env() { # entradas pasta-da-versão
+    local new="$ROOT/.devkit/env.new" keep=0 line
+    if [ -f "$ROOT/.env" ]; then cp "$ROOT/.env" "$new"; else : > "$new"; fi
+    chmod 600 "$new"
+    if [ -f "$1/env" ]; then
+        if [ -f "$1/preserve" ]; then
+            keep=1
+            log "--preserve: os valores que a VPS já tem ficam; os enviados só preenchem o que falta"
+        fi
+        merge_env "$1/env" "$new" "$keep" "$(kv_get "$2/deploy.conf" PRESERVE)"
+    fi
+    if [ -f "$1/env-add" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && kv_set "$new" "${line%%=*}" "${line#*=}"
+        done < "$1/env-add"
+    fi
+    apply_preserve "$2/deploy.conf" "$new"
 }
 
 remote_release_up() { # app pasta versão
@@ -903,17 +997,7 @@ remote_release_up() { # app pasta versão
     [ "$(kv_get "$code/deploy.conf" APP)" = "$APP" ] || die "o deploy.conf da versão é de outro app."
     HEALTH=$(kv_get "$code/deploy.conf" HEALTH)
 
-    # Configuração: preparada em .env.new e só trocada na ativação.
-    if [ -f "$inputs/env" ]; then cp "$inputs/env" "$ROOT/.devkit/env.new"
-    elif [ -f "$ROOT/.env" ]; then cp "$ROOT/.env" "$ROOT/.devkit/env.new"
-    else : > "$ROOT/.devkit/env.new"; fi
-    chmod 600 "$ROOT/.devkit/env.new"
-    if [ -f "$inputs/env-add" ]; then
-        while IFS= read -r k; do
-            [ -n "$k" ] && kv_set "$ROOT/.devkit/env.new" "${k%%=*}" "${k#*=}"
-        done < "$inputs/env-add"
-    fi
-    apply_preserve "$code/deploy.conf" "$inputs" "$ROOT/.devkit/env.new" "$ROOT/.env"
+    prepare_env "$inputs" "$code"
     missing=""
     for k in $(kv_get "$code/deploy.conf" REQUIRED); do
         [ -n "$(kv_get "$ROOT/.devkit/env.new" "$k")" ] || missing+="$k "

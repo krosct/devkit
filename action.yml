@@ -36,15 +36,22 @@ inputs:
     description: chave privada do Certificado de Origem (PEM), opcional
     required: false
     default: ''
-  no-preserve:
-    description: "'true' gera de novo as chaves PRESERVE que não vierem dos secrets"
+  env:
+    description: >-
+      configuração do app, uma linha CHAVE=valor por configuração (o valor vem de um secret ou variable).
+      Cada chave substitui a da VPS; vazia, é removida (o app usa o padrão). As outras chaves da VPS ficam.
+    required: false
+    default: ''
+  preserve:
+    description: "'true' mantém os valores que a VPS já tem; os de env só preenchem o que falta ou está vazio"
     required: false
     default: 'false'
   secrets:
-    description: 'passe toJSON(secrets) do workflow: de onde saem as chaves ENV do deploy.conf'
-    required: true
+    description: 'obsoleto (use env): toJSON(secrets), lido com o ENV do deploy.conf'
+    required: false
+    default: '{}'
   vars:
-    description: 'passe toJSON(vars) do workflow: alternativa aos secrets para o que não é segredo'
+    description: 'obsoleto (use env): toJSON(vars), lido com o ENV do deploy.conf'
     required: false
     default: '{}'
 
@@ -63,7 +70,8 @@ runs:
         DEVKIT_DOMAIN: ${{ inputs.domain }}
         DEVKIT_ORIGIN_CERT: ${{ inputs.origin-cert }}
         DEVKIT_ORIGIN_KEY: ${{ inputs.origin-key }}
-        DEVKIT_NO_PRESERVE: ${{ inputs.no-preserve }}
+        DEVKIT_ENV: ${{ inputs.env }}
+        DEVKIT_PRESERVE: ${{ inputs.preserve }}
         DEVKIT_SECRETS: ${{ inputs.secrets }}
         DEVKIT_VARS: ${{ inputs.vars }}
       run: '"$GITHUB_ACTION_PATH/deploy.sh" ci'
