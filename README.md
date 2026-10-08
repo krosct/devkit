@@ -24,9 +24,9 @@ ou `usuario@host`. O resto é opcional:
 | `--domain DOMINIO` | endereço público do app (padrão: o que a VPS já usa para ele) |
 | `--no-domain` | sem endereço público (o site do app sai do Caddy) |
 | `--cert ARQUIVO --key ARQUIVO` | Certificado de Origem do Cloudflare (SSL "Full (strict)") |
-| `--env ARQUIVO` | substitui a configuração do app na VPS por este arquivo |
+| `--env ARQUIVO` | envia a configuração deste arquivo para a VPS (veja [Configuração na VPS](#configuração-na-vps)) |
+| `--preserve` | com `--env`: o que a VPS já tem com valor fica; o enviado só preenche o que falta |
 | `--path PASTA` | pasta do app na VPS (padrão: `/srv/<app>`) |
-| `--no-preserve` | gera de novo as chaves `PRESERVE` que não vierem na configuração nova |
 
 O que faltar é perguntado no terminal, e a resposta fica guardada na VPS (o próximo deploy não
 pergunta de novo):
@@ -57,7 +57,6 @@ HEALTH=/healthz                               # caminho que responde 200 (sem el
 REQUIRED="TOKEN API_KEY"                      # configuração obrigatória
 PRESERVE="LOG_HASH_SALT"                      # opcional: sobrevivem aos deploys (veja abaixo)
 SERVICE_ENV="DATA_DIR={data} PORT={port} PUBLIC_URL={url}"   # variáveis fixas do serviço
-ENV="TOKEN API_KEY GITHUB_CLIENT_ID=GH_OAUTH_CLIENT_ID"      # CI: chaves lidas dos secrets
 ```
 
 Em `RUN` e `SERVICE_ENV`: `{root}` (pasta do app), `{data}` (dados persistentes), `{port}` (porta
@@ -68,11 +67,25 @@ interna, só em 127.0.0.1, escolhida pelo devkit sem conflito com outros apps), 
 `RUN` é **um comando só**: o devkit faz `exec <RUN>` na pasta da versão. Em vez de
 `cd backend && uvicorn ...`, use as opções do próprio programa (ex.: `uvicorn --app-dir backend ...`).
 
-**`PRESERVE`**: chaves da configuração que sobrevivem aos deploys, para valores que o servidor pode
-inventar (um salt, uma chave interna). A cada deploy: um valor novo e explícito (do `--env`, dos
-secrets) vence; sem ele, fica o que já está na VPS; sem nenhum, o devkit gera um aleatório (48
-caracteres hex) e o guarda. `--no-preserve` (ou `no-preserve: 'true'` na action) ignora os valores
-guardados e gera de novo o que não vier na configuração nova.
+**`PRESERVE`**: chaves que o servidor pode inventar (um salt, uma chave interna). Se uma delas
+ficar sem valor depois do deploy, o devkit gera um aleatório (48 caracteres hex) e o guarda; nos
+deploys seguintes ele fica. Um valor enviado para ela vence; enviada vazia, é ignorada.
+
+## Configuração na VPS
+
+A configuração do app fica em `/srv/<app>/.env`. Num deploy, a configuração **enviada** (o
+`--env ARQUIVO` no terminal, ou a entrada `env` da action no CI) é aplicada sobre ela, chave a
+chave:
+
+| Situação | Sem `--preserve` (padrão) | Com `--preserve` / `DEPLOY_PRESERVE=true` |
+|---|---|---|
+| Chave enviada com valor | o valor enviado substitui o da VPS | fica o da VPS, se tiver valor; senão, o enviado |
+| Chave enviada vazia (`CHAVE=`) | sai do `.env` (o app usa o padrão dele) | fica o da VPS, se tiver valor |
+| Chave que não foi enviada | fica como está | fica como está |
+
+Sem nada enviado (`deploy.sh vps HOST` sem `--env`), a configuração da VPS fica como está. O que
+for obrigatório (`REQUIRED`) e ficar vazio é perguntado no terminal; no CI, o deploy para antes de
+mexer em qualquer coisa.
 
 ## Na VPS
 
@@ -127,7 +140,7 @@ No workflow do projeto, depois dos testes:
     concurrency: { group: deploy-production, cancel-in-progress: false }
     steps:
       - uses: actions/checkout@v7
-      - uses: krosct/devkit@main
+      - uses: krosct/devkit@v1.0.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           user: ${{ secrets.DEPLOY_USER }}
@@ -138,9 +151,20 @@ No workflow do projeto, depois dos testes:
           domain: ${{ secrets.DEPLOY_SITE_ADDRESS || vars.DEPLOY_SITE_ADDRESS }}
           origin-cert: ${{ secrets.DEPLOY_ORIGIN_CERT }}
           origin-key: ${{ secrets.DEPLOY_ORIGIN_KEY }}
-          secrets: ${{ toJSON(secrets) }}
-          vars: ${{ toJSON(vars) }}
+          preserve: ${{ secrets.DEPLOY_PRESERVE || vars.DEPLOY_PRESERVE }}
+          # A configuração do app: uma linha por chave, cada uma com o secret ou variable dela.
+          env: |
+            TOKEN=${{ secrets.TOKEN || vars.TOKEN }}
+            API_KEY=${{ secrets.API_KEY }}
+            GITHUB_CLIENT_ID=${{ secrets.GH_OAUTH_CLIENT_ID || vars.GH_OAUTH_CLIENT_ID }}
 ```
+
+Na entrada `env`, cada linha é `CHAVE=valor` (linhas em branco e `#` são ignoradas; um valor não
+pode ter quebra de linha). Um secret que não existe vira `CHAVE=` e a chave sai do `.env` da VPS
+(veja [Configuração na VPS](#configuração-na-vps)). Passe só os secrets que o app usa, um por um:
+nunca `toJSON(secrets)`, que entrega todos (o GitHub segura o workflow como suspeito em
+repositórios públicos). O formato antigo (`ENV` no `deploy.conf` com `secrets: ${{ toJSON(secrets) }}`)
+ainda funciona, com um aviso, até o projeto migrar.
 
 | Secret | |
 |---|---|
@@ -150,10 +174,16 @@ No workflow do projeto, depois dos testes:
 | `DEPLOY_SITE_ADDRESS` | opcional: o domínio do app |
 | `DEPLOY_ORIGIN_CERT`, `DEPLOY_ORIGIN_KEY` | opcionais: o Certificado de Origem e a chave (PEM) |
 | `DEPLOY_PATH`, `DEPLOY_PORT` | opcionais |
-| As chaves de `ENV` do `deploy.conf` | a configuração do app; a cada deploy ela substitui a da VPS |
+| `DEPLOY_PRESERVE` | opcional (variable): `true` mantém o que a VPS já tem com valor |
+| Os da entrada `env` | a configuração do app |
 
 O CI precisa de sudo sem senha na VPS só se ela ainda não estiver preparada (pasta, linger ou
 Caddy); depois de um primeiro deploy pelo terminal, não precisa mais.
 
-Como este repositório é privado, libere o uso pelos outros repositórios uma vez: *Settings →
-Actions → General → Access → "Accessible from repositories owned by the user 'krosct'"*.
+## Versões
+
+Os projetos usam o devkit por uma versão fixa (`krosct/devkit@v1.0.0`), nunca pela `main`: uma
+mudança aqui só chega a um projeto quando ele troca o número. Cada versão é uma tag `vX.Y.Z`
+([SemVer](https://semver.org/lang/pt-BR/)): o último número para correções, o do meio para o que
+é novo e compatível, o primeiro para o que exige mudar o `deploy.conf` ou o workflow dos projetos.
+No terminal, `deploy.sh` roda a versão da pasta clonada.
