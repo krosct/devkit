@@ -36,7 +36,7 @@ pergunta de novo):
 | Domínio (app com site, VPS sem domínio para ele) | pergunta; vazio = sem HTTPS |
 | Certificado (VPS não tem e você não passou) | pergunta se o domínio está no Cloudflare em "Full (strict)"; se sim, pede o `.pem` e o `.key`; se não, usa Let's Encrypt |
 | Configuração do app na VPS | oferece usar o `.env` do projeto; o que for obrigatório e estiver vazio é perguntado |
-| Root (1ª vez: pasta, linger, Caddy) | usa o sudo sem senha ou pede a sua senha do sudo |
+| Root (1ª vez: pasta, linger, Caddy, firewall) | usa o sudo sem senha ou pede a sua senha do sudo |
 
 Sem terminal (CI), nada é perguntado: o deploy para dizendo exatamente o que falta.
 
@@ -109,6 +109,7 @@ sistema) para todos os apps, que não pertence a nenhum deles.
 | Caddyfile da camada: só importa os sites | `/etc/caddy/Caddyfile` |
 | Site de cada app, escrito e removido só pelo deploy dele | `/srv/caddy/sites/<app>.caddy` |
 | Certificado de Origem do Cloudflare (opcional) | `/srv/caddy/certs/<app>.pem` e `.key` |
+| Serviço que libera as portas 80/443 a cada boot | `/etc/systemd/system/devkit-ports.service` |
 
 Só duas situações são aceitas: **a camada já existe**, ou **não há Caddy nenhum** (e ela é
 instalada). Qualquer outra coisa, como outro Caddy rodando ou outro programa nas portas 80/443,
@@ -122,6 +123,23 @@ faixas do Cloudflare: de qualquer outro lugar o cabeçalho é ignorado, então n
 o IP. Em apps Python com uvicorn, use `--proxy-headers --forwarded-allow-ips 127.0.0.1`.
 Uma VPS com a camada de uma versão anterior é atualizada no próximo deploy (com sudo), por reload,
 sem derrubar os sites.
+
+**Firewall.** Num app com site, todo deploy confere se as portas 80 e 443 estão liberadas no
+firewall da VPS (ufw, firewalld, iptables ou nftables) e, se não estiverem, as libera com root.
+Regras de iptables/nftables que não foram salvas somem quando a VPS reinicia (é o caso das imagens
+da Oracle Cloud): por isso o devkit instala o serviço `devkit-ports`, que as recoloca a cada boot,
+antes do Caddy subir, sem precisar de um deploy. O devkit nunca liga um firewall que está
+desligado nem mexe em outras portas (o SSH fica como está), e uma regra que já aceita a porta,
+mesmo só de algumas origens (como as faixas do Cloudflare), é respeitada.
+
+| Sudo do usuário do SSH | O que o deploy confere |
+|---|---|
+| sem senha | as regras do firewall, a cada deploy; fechou, ele abre |
+| com senha | o serviço `devkit-ports` instalado e sem falha; senão pede a senha (no terminal) |
+| nenhum (ou CI sem sudo sem senha) | só avisa; a conferência de fora no fim diz se o site responde |
+
+O firewall do provedor (security group da AWS, security list da Oracle Cloud etc.) fica fora da
+VPS: libere 80 e 443 no painel dele.
 
 A versão nova só fica se o serviço continuar de pé e, com site, responder no `HEALTH`; senão volta
 a anterior, com o log do app na tela. No fim, o deploy acessa `https://dominio/HEALTH` de fora e
@@ -178,7 +196,8 @@ ainda funciona, com um aviso, até o projeto migrar.
 | Os da entrada `env` | a configuração do app |
 
 O CI precisa de sudo sem senha na VPS só se ela ainda não estiver preparada (pasta, linger ou
-Caddy); depois de um primeiro deploy pelo terminal, não precisa mais.
+Caddy); depois de um primeiro deploy pelo terminal, não precisa mais. Sem ele, o CI não confere as
+regras do firewall a cada deploy (confia no serviço `devkit-ports`; veja [Na VPS](#na-vps)).
 
 ## Versões
 
