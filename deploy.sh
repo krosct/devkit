@@ -179,7 +179,7 @@ run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
     local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 env_mode="" missing k v no_preserve=0
     HOST=${1:-}
-    [ -n "$HOST" ] && [ "${HOST#-}" = "$HOST" ] || die "informe o HOST da VPS: deploy.sh vps HOST [opções]"
+    if [ -z "$HOST" ] || [ "${HOST#-}" != "$HOST" ]; then die "informe o HOST da VPS: deploy.sh vps HOST [opções]"; fi
     [[ $HOST =~ ^[A-Za-z0-9@._:-]+$ ]] || die "HOST inválido: $HOST"
     shift
     while [ $# -gt 0 ]; do
@@ -195,7 +195,7 @@ run_vps() {
         esac
     done
     load_conf
-    [ -n "$(conf INSTALL)" ] && [ -n "$(conf RUN)" ] || die "deploy.conf: faltam INSTALL e/ou RUN."
+    if [ -z "$(conf INSTALL)" ] || [ -z "$(conf RUN)" ]; then die "deploy.conf: faltam INSTALL e/ou RUN."; fi
     [ -z "$path" ] || [[ $path =~ ^[A-Za-z0-9._/~-]+$ ]] || die "--path inválido: $path"
 
     log "Conferindo a VPS ($HOST)"
@@ -227,7 +227,7 @@ run_vps() {
 
     # Certificado de Origem: o das opções ou, se a VPS não tem e ninguém decidiu, perguntado.
     if [ -n "$cert$key" ]; then
-        [ -f "$cert" ] && [ -f "$key" ] || die "--cert e --key precisam apontar para arquivos existentes."
+        if [ ! -f "$cert" ] || [ ! -f "$key" ]; then die "--cert e --key precisam apontar para arquivos existentes."; fi
         [ -n "$domain" ] || die "--cert sem domínio: o certificado não seria usado."
         problem=$(cert_problem "$cert" "$key" "$domain")
         [ -z "$problem" ] || die "$problem."
@@ -334,7 +334,9 @@ run_ci() {
     [[ $host =~ ^[A-Za-z0-9.:-]+$ ]] || die "DEPLOY_HOST inválido ou vazio."
     [[ $user =~ ^[a-z_][a-z0-9_-]*$ ]] || die "DEPLOY_USER inválido ou vazio."
     [[ $port =~ ^[0-9]+$ ]] || die "DEPLOY_PORT inválido."
-    [ -n "${DEVKIT_SSH_KEY:-}" ] && [ -n "${DEVKIT_KNOWN_HOSTS:-}" ] || die "faltam os secrets DEPLOY_SSH_KEY e/ou DEPLOY_KNOWN_HOSTS."
+    if [ -z "${DEVKIT_SSH_KEY:-}" ] || [ -z "${DEVKIT_KNOWN_HOSTS:-}" ]; then
+        die "faltam os secrets DEPLOY_SSH_KEY e/ou DEPLOY_KNOWN_HOSTS."
+    fi
     install -d -m 700 ~/.ssh
     (umask 077
      printf '%s\n' "$DEVKIT_SSH_KEY" > ~/.ssh/devkit_vps
@@ -679,7 +681,7 @@ publish_site() { # arquivo-preparado
 unpublish_site() {
     local site
     site=$(site_path)
-    [ -f "$site" ] && [ -w "$SHARED_DIR/sites" ] || return 0
+    if [ ! -f "$site" ] || [ ! -w "$SHARED_DIR/sites" ]; then return 0; fi
     shared_lock
     caddy_validate_with "" || die "a configuração do Caddy não valida sem o site do $APP; ele foi mantido."
     rm -f "${site:?}"
@@ -880,9 +882,9 @@ apply_preserve() { # deploy.conf entradas env-novo env-atual
 remote_release_up() { # app pasta versão
     local release=$3 inputs="$DEVKIT_DIR/inputs" code staged="" previous problem k missing
     APP=$1 ROOT=$2
-    [[ $APP =~ $APP_RE ]] && [[ $release =~ $RELEASE_RE ]] || die "app ou versão inválidos."
+    if ! [[ $APP =~ $APP_RE ]] || ! [[ $release =~ $RELEASE_RE ]]; then die "app ou versão inválidos."; fi
     mkdir -p "$ROOT" 2>/dev/null || true
-    [ -d "$ROOT" ] && [ -w "$ROOT" ] || die "a pasta $ROOT não existe ou não é gravável."
+    if [ ! -d "$ROOT" ] || [ ! -w "$ROOT" ]; then die "a pasta $ROOT não existe ou não é gravável."; fi
     # A pasta de envio (~/.cache/devkit/<app>/<versão>) some no fim, dê certo ou não.
     case $DEVKIT_DIR in */.cache/devkit/"$APP"/"$release") trap 'rm -rf "${WORK:?}" "${DEVKIT_DIR:?}"' EXIT ;; esac
     mkdir -p "$ROOT/.devkit" "$ROOT/releases" "$ROOT/data"
