@@ -32,12 +32,14 @@ REQUIRED="TOKEN"
 - 📁 App em `/srv/<app>`, serviço systemd do usuário, sem root
 - 🔒 HTTPS por um Caddy compartilhado entre os apps
 - 🔥 Portas 80/443 liberadas no firewall, também depois de reinícios
+- 🛡️ Atrás do Cloudflare (Certificado de Origem), só ele chega aos apps: 80/443 abertas só para as
+  faixas dele (se todos os sites da VPS estão nele) e o Caddy corta quem vem direto pelo IP
 - ↩️ Versão nova com problema volta sozinha para a anterior
 
 ## 🤖 CI (GitHub Actions)
 
 ```yaml
-- uses: krosct/devkit@v1.1.0
+- uses: krosct/devkit@v1.2.0
   with:
     host: ${{ secrets.DEPLOY_HOST }}
     user: ${{ secrets.DEPLOY_USER }}
