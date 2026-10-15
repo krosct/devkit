@@ -37,6 +37,10 @@ WEB_PORTS="80 443"
 PORTS_LIB=/usr/local/lib/devkit
 PORTS_UNIT=/etc/systemd/system/devkit-ports.service
 PORTS_MARK="# devkit: portas do Caddy compartilhado v1"
+# "cloudflare" (80/443 só para as faixas do Cloudflare) ou "open" (para todos). Fica numa pasta de
+# root e vale também para o serviço devkit-ports.
+PORTS_MODE_FILE=$PORTS_LIB/mode
+CF_COMMENT=devkit-cloudflare
 # Faixas do Cloudflare (https://www.cloudflare.com/ips/, conferidas em 2026-10-07). Só de dentro
 # delas o Caddy aceita o CF-Connecting-IP como IP do visitante; de qualquer outro lugar, o
 # cabeçalho é ignorado e não dá para falsificar o IP.
@@ -213,7 +217,7 @@ build_package() { # destino.tgz
 
 run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
-    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 want_ports=0 missing k v preserve=0
+    local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 want_ports=0 missing k v preserve=0 ports_mode=open
     local root_msg="Preparando a VPS com root (só desta vez)"
     HOST=${1:-}
     if [ -z "$HOST" ] || [ "${HOST#-}" != "$HOST" ]; then die "informe o HOST da VPS: deploy.sh vps HOST [opções]"; fi
@@ -310,11 +314,18 @@ run_vps() {
         done
     fi
 
+    # Portas 80/443 só para o Cloudflare quando este app e todos os outros sites da VPS usam
+    # Certificado de Origem; com algum site fora dele (Let's Encrypt), abertas para todos.
+    if [ -n "$domain" ] && [ "$(pf OTHERS_CLOUDFLARE)" = yes ] && [ "$cert_mode" != letsencrypt ] &&
+        { [ -n "$cert" ] || [ "$(pf CERT)" = yes ]; }; then
+        ports_mode=cloudflare
+    fi
+
     # Root só quando falta algo do sistema: a pasta, o linger, a camada do Caddy ou, num app com
-    # site, as portas 80/443 no firewall (fechadas, ou sem o serviço que as libera a cada boot).
-    # Só as portas não param o deploy sem sudo: fica o aviso, e a conferência de fora no fim diz se
-    # o site responde.
-    if [ -n "$domain" ] && [ "$(pf PORTS)" != ok ]; then want_ports=1; fi
+    # site, as portas 80/443 no firewall (fechadas, sem o serviço que as libera a cada boot, ou
+    # fora do modo certo). Só as portas não param o deploy sem sudo: fica o aviso, e a conferência
+    # de fora no fim diz se o site responde.
+    if [ -n "$domain" ] && { [ "$(pf PORTS)" != ok ] || [ "$(pf PORTS_MODE)" != "$ports_mode" ]; }; then want_ports=1; fi
     if [ "$(pf ROOT_OK)" != yes ] || [ "$(pf LINGER)" != yes ] || [ "$want_caddy" = 1 ]; then
         need_root=1
         case $(pf SUDO) in
@@ -330,11 +341,16 @@ run_vps() {
             nopasswd) need_root=1; sudo_mode="sudo -n" ;;
             password) if interactive; then need_root=1; sudo_mode="sudo"; fi ;;
         esac
+        problem=$(pf PORTS_PROBLEM)
+        if [ -z "$problem" ]; then
+            if [ "$ports_mode" = cloudflare ]; then problem="portas 80/443 abertas para todos, e não só para o Cloudflare"
+            else problem="portas 80/443 só para o Cloudflare, e há site fora dele"; fi
+        fi
         if [ "$need_root" = 1 ]; then
-            root_msg="Firewall da VPS: $(pf PORTS_PROBLEM). Conferindo e liberando as portas 80/443 com root"
+            root_msg="Firewall da VPS: $problem. Conferindo e ajustando as portas 80/443 com root"
         else
             want_ports=0
-            warn "firewall da VPS: $(pf PORTS_PROBLEM). Liberar as portas 80/443 precisa de sudo: rode este deploy uma vez num terminal (ou dê sudo sem senha ao usuário $(pf USER))."
+            warn "firewall da VPS: $problem. Ajustar as portas 80/443 precisa de sudo: rode este deploy uma vez num terminal (ou dê sudo sem senha ao usuário $(pf USER))."
         fi
     fi
 
@@ -361,9 +377,9 @@ run_vps() {
     if [ "$need_root" = 1 ]; then
         log "$root_msg"
         if [ "$sudo_mode" = sudo ]; then
-            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports"
+            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode"
         else
-            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports" </dev/null
+            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode" </dev/null
         fi || die "a preparação com root falhou (veja acima)."
     fi
 
@@ -631,6 +647,10 @@ setup_shared_caddy() { # usuário (como root)
 # Só libera as portas num firewall que já está ativo (ufw, firewalld, iptables ou nftables): nunca
 # liga um firewall nem mexe em outras portas. Uma regra que já aceita a porta (mesmo só de algumas
 # origens, como as faixas do Cloudflare) é respeitada.
+# Quando todos os sites da VPS estão atrás do Cloudflare (Certificado de Origem), as portas ficam só
+# para as faixas dele: um bloco no topo do INPUT do iptables/ip6tables aceita 80/443 delas e
+# descarta o resto. Vale com qualquer firewall (ufw e firewalld também passam pelo netfilter) e
+# até sem nenhum; o resto das regras não é tocado. Quem chega pelo IP da VPS não alcança os apps.
 
 # Comandos de /usr/sbin, que nem sempre está no PATH de quem não é root.
 has_cmd() { command -v "$1" >/dev/null 2>&1 || [ -x "/usr/sbin/$1" ] || [ -x "/sbin/$1" ]; }
@@ -677,6 +697,75 @@ nft_input_chains() { # saída-do-"nft list ruleset"
 
 nft_accepts() { # saída-do-"nft list chain" porta
     grep -qE "tcp dport (\{ )?([0-9]+, )*$2([ ,]|$).*accept" <<<"$1"
+}
+
+cf_ranges() { # 4|6: as faixas do Cloudflare da família
+    local r
+    for r in $CLOUDFLARE_RANGES; do
+        case $r in *:*) [ "$1" = 6 ] && echo "$r" ;; *) [ "$1" = 4 ] && echo "$r" ;; esac
+    done
+    return 0
+}
+
+ipt_family() { if [ "$1" = ip6tables ]; then echo 6; else echo 4; fi; }
+
+# O INPUT começa com o bloco do devkit: as faixas do Cloudflare aceitas em 80/443 e, logo depois,
+# o descarte do resto nessas portas?
+ipt_cf_ok() { # comando
+    local rules n want got
+    rules=$(as_root "$1" -S INPUT 2>/dev/null | grep '^-A INPUT ') || return 1
+    want=$(cf_ranges "$(ipt_family "$1")" | sort)
+    n=$(grep -c . <<<"$want")
+    got=$(head -n "$n" <<<"$rules" | grep -- "--comment $CF_COMMENT" | grep -- ' -j ACCEPT' |
+        sed -n 's/^-A INPUT -s \([^ ]*\) .*/\1/p' | sort)
+    [ "$got" = "$want" ] || return 1
+    sed -n "$((n + 1))p" <<<"$rules" | grep -- "--comment $CF_COMMENT" | grep -q -- ' -j DROP'
+}
+
+ipt_delete_devkit() { # comando [só-cloudflare]: remove as regras do INPUT que o devkit pôs
+    local line pat='--comment (devkit|devkit-cloudflare)( |$)' args
+    [ -z "${2:-}" ] || pat="--comment $CF_COMMENT( |\$)"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        read -r -a args <<<"${line#-A INPUT }"
+        as_root "$1" -D INPUT "${args[@]}" 2>/dev/null || true
+    done < <(as_root "$1" -S INPUT 2>/dev/null | grep -E -- "$pat" || true)
+}
+
+ipt_cf_apply() { # comando: refaz o bloco no topo do INPUT
+    local r
+    ipt_delete_devkit "$1"
+    as_root "$1" -I INPUT 1 ! -i lo -p tcp -m multiport --dports 80,443 -m comment --comment "$CF_COMMENT" -j DROP ||
+        die "não consegui restringir as portas 80/443 ao Cloudflare no $1."
+    for r in $(cf_ranges "$(ipt_family "$1")"); do
+        as_root "$1" -I INPUT 1 -s "$r" -p tcp -m multiport --dports 80,443 -m comment --comment "$CF_COMMENT" -j ACCEPT ||
+            die "não consegui restringir as portas 80/443 ao Cloudflare no $1."
+    done
+}
+
+ports_mode() { cat "$PORTS_MODE_FILE" 2>/dev/null || echo open; }
+
+# check: imprime o que difere do modo (ex.: "iptables:cloudflare"; vazio = certo).
+# apply: acerta. Precisa de root ou de sudo sem senha.
+web_ports_cloudflare() { # check|apply
+    local c found=0 diff=""
+    for c in iptables ip6tables; do
+        has_cmd "$c" || continue
+        as_root "$c" -S INPUT >/dev/null 2>&1 || continue
+        found=1
+        if [ "$(ports_mode)" = cloudflare ]; then
+            ipt_cf_ok "$c" && continue
+            diff+="$c:cloudflare "
+            [ "$1" = check ] || ipt_cf_apply "$c"
+        elif as_root "$c" -S INPUT 2>/dev/null | grep -q -- "--comment $CF_COMMENT"; then
+            diff+="$c:aberto "
+            [ "$1" = check ] || ipt_delete_devkit "$c" cloudflare
+        fi
+    done
+    if [ "$found" = 0 ] && [ "$(ports_mode)" = cloudflare ] && [ "$1" = apply ]; then
+        warn "sem iptables na VPS: as portas 80/443 ficam abertas para todos; só o Caddy recusa quem não vem do Cloudflare."
+    fi
+    printf '%s' "${diff% }"
 }
 
 # check: imprime as portas fechadas (ex.: "iptables:80 iptables:443"; vazio = abertas).
@@ -730,6 +819,16 @@ web_ports_firewall() { # check|open
 
 open_web_ports() { # como root
     local opened left
+    # Primeiro o modo (o bloco do Cloudflare sai ou entra), depois as portas abertas para o Caddy.
+    if [ -n "$(web_ports_cloudflare apply)" ]; then
+        if [ "$(ports_mode)" = cloudflare ]; then
+            log "Firewall da VPS: portas 80/443 só para o Cloudflare (acesso direto pelo IP recusado)"
+        else
+            log "Firewall da VPS: portas 80/443 abertas para todos (há site fora do Cloudflare)"
+        fi
+    fi
+    left=$(web_ports_cloudflare check)
+    [ -z "$left" ] || die "não consegui deixar o firewall da VPS no modo $(ports_mode): $left."
     opened=$(web_ports_firewall open)
     [ -z "$opened" ] || log "Firewall da VPS: liberadas as portas do Caddy ($opened)"
     left=$(web_ports_firewall check)
@@ -738,7 +837,7 @@ open_web_ports() { # como root
 
 # O serviço devkit-ports libera as portas a cada boot, depois que o firewall carrega as regras
 # salvas. O script dele fica numa pasta de root (o usuário do deploy não pode trocá-lo).
-setup_ports_guard() { # como root
+setup_ports_guard() { # modo (como root)
     local unit
     unit="$PORTS_MARK
 # Gerado pelo devkit. Não edite: é sobrescrito pelo deploy.
@@ -763,6 +862,9 @@ WantedBy=multi-user.target"
         log "Serviço devkit-ports instalado (libera as portas 80/443 a cada boot)"
     fi
     systemctl enable --quiet devkit-ports
+    case ${1:-open} in cloudflare | open) ;; *) die "modo das portas inválido: $1" ;; esac
+    printf '%s\n' "${1:-open}" > "$PORTS_MODE_FILE"
+    chmod 644 "$PORTS_MODE_FILE"
     open_web_ports
     # Roda de novo pelo serviço (já sem nada a fazer) para que o estado dele mostre que deu certo.
     if ! systemctl restart devkit-ports; then
@@ -783,6 +885,8 @@ ports_state() {
     if [ "$(id -u)" = 0 ] || can_sudo; then
         closed=$(web_ports_firewall check)
         if [ -n "$closed" ]; then echo "portas fechadas no firewall da VPS: $closed"; return; fi
+        closed=$(web_ports_cloudflare check)
+        if [ -n "$closed" ]; then echo "firewall da VPS fora do modo $(ports_mode): $closed"; return; fi
     fi
     echo ok
 }
@@ -826,6 +930,14 @@ remote_preflight() { # app pasta obrigatórias...
     if linger_on "$me"; then echo LINGER=yes; else echo LINGER=no; fi
     state=$(ports_state)
     if [ "$state" = ok ]; then echo PORTS=ok; else echo PORTS=setup; echo "PORTS_PROBLEM=$state"; fi
+    echo "PORTS_MODE=$(ports_mode)"
+    # Os sites dos outros apps estão todos atrás do Cloudflare (com Certificado de Origem)?
+    state=yes
+    for k in "$SHARED_DIR"/sites/*.caddy; do
+        if [ ! -e "$k" ] || [ "$k" = "$SHARED_DIR/sites/$app.caddy" ]; then continue; fi
+        grep -q "^[[:space:]]*tls $SHARED_DIR/certs/" "$k" 2>/dev/null || state=no
+    done
+    echo "OTHERS_CLOUDFLARE=$state"
     if can_sudo; then echo SUDO=nopasswd
     elif command -v sudo >/dev/null 2>&1 && id -nG "$me" | grep -qwE 'sudo|wheel|admin'; then echo SUDO=password
     else echo SUDO=none; fi
@@ -834,8 +946,8 @@ remote_preflight() { # app pasta obrigatórias...
 
 # ---------- _root-setup: o que só root faz (pasta, linger, camada do Caddy, firewall) ----------
 
-remote_root_setup() { # app pasta usuário quer-caddy quer-portas
-    local app=$1 root=$2 user=$3 want_caddy=$4 want_ports=$5
+remote_root_setup() { # app pasta usuário quer-caddy quer-portas modo-das-portas
+    local app=$1 root=$2 user=$3 want_caddy=$4 want_ports=$5 mode=${6:-open}
     [ "$(id -u)" = 0 ] || die "a preparação precisa de root."
     if ! [[ $app =~ $APP_RE ]] || ! [[ $user =~ ^[a-z_][a-z0-9_-]*$ ]] || ! id "$user" >/dev/null 2>&1; then
         die "app ou usuário inválido."
@@ -851,7 +963,7 @@ remote_root_setup() { # app pasta usuário quer-caddy quer-portas
         log "Linger ativado para $user (os apps continuam rodando sem sessão aberta)"
     fi
     [ "$want_caddy" != 1 ] || setup_shared_caddy "$user"
-    [ "$want_ports" != 1 ] || setup_ports_guard
+    [ "$want_ports" != 1 ] || setup_ports_guard "$mode"
 }
 
 # ---------- _release-up: instala e ativa a versão (como o usuário do SSH) ----------
@@ -860,15 +972,18 @@ site_path() { printf '%s' "$SHARED_DIR/sites/$APP.caddy"; }
 cert_base() { printf '%s' "$SHARED_DIR/certs/$APP"; }
 
 site_block() { # domínio porta
-    local tls=""
+    local tls="" guard=""
+    # Com Certificado de Origem, o site está atrás do Cloudflare: conexões que não vêm das faixas
+    # dele (alguém indo direto ao IP da VPS) são cortadas, mesmo sem firewall.
     if [ -f "$(cert_base).pem" ] && [ -f "$(cert_base).key" ]; then
         tls=$(printf '\n\ttls %s.pem %s.key' "$(cert_base)" "$(cert_base)")
+        guard=$(printf '\n\t@outside_cloudflare not remote_ip %s\n\tabort @outside_cloudflare' "$CLOUDFLARE_RANGES")
     fi
     # O app recebe o IP real do visitante em X-Forwarded-For e X-Real-IP (o {client_ip} do Caddy,
     # que atrás do Cloudflare é o CF-Connecting-IP); respostas comprimidas com zstd ou gzip.
     cat <<EOF
 # Gerado pelo devkit para o $APP. Não edite: é sobrescrito a cada deploy.
-$1 {
+$1 {$guard
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:$2 {
 		header_up X-Forwarded-For {client_ip}
@@ -1267,7 +1382,7 @@ main() {
         ci) run_ci ;;
         status | logs | restart | stop) run_helper "$1" "${2:-}" ;;
         _preflight) shift; remote_preflight "$@" ;;
-        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
         _open-ports) [ "$(id -u)" = 0 ] || die "_open-ports precisa de root."; open_web_ports ;;
         _release-up) remote_release_up "${2:-}" "${3:-}" "${4:-}" ;;
         -h | --help | help | "") usage 0 ;;
