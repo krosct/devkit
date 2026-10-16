@@ -998,7 +998,9 @@ setup_memcg() { # usuário (como root)
     # continuam de pé).
     local cg=/sys/fs/cgroup/user.slice
     for cg in "$cg" "$cg/user-$uid.slice" "$cg/user-$uid.slice/user@$uid.service"; do
-        [ -f "$cg/cgroup.subtree_control" ] && echo +memory > "$cg/cgroup.subtree_control" 2>/dev/null || true
+        if [ -f "$cg/cgroup.subtree_control" ]; then
+            echo +memory > "$cg/cgroup.subtree_control" 2>/dev/null || true
+        fi
     done
 }
 
