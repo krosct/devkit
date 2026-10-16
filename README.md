@@ -25,6 +25,9 @@ REQUIRED="TOKEN"
 ```
 
 - 🧩 Opcionais: `BUILD`, `INCLUDE`, `PRESERVE`, `SERVICE_ENV`
+- 🧠 `MEMORY_MAX=300M`: limite de memória do serviço, conferido a cada deploy (sem ele valendo, o deploy falha)
+- 🐳 `DOCKER=1`: o app usa Docker; o deploy instala (sem mexer no firewall) e dá acesso ao usuário
+- 🚪 `PUBLIC_PATHS="/webhook"`: só esses caminhos (e o `HEALTH`) chegam ao app pelo Caddy; o resto é 404
 - 🔤 Variáveis: `{root}` `{data}` `{port}` `{domain}` `{url}`
 
 ## 🖥️ Na VPS

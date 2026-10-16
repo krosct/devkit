@@ -218,6 +218,7 @@ build_package() { # destino.tgz
 run_vps() {
     local domain="" domain_opt="" cert="" key="" env_opt="" path="" release stage bundle problem
     local cert_mode="" need_root=0 sudo_mode="" want_caddy=0 want_ports=0 missing k v preserve=0 ports_mode=open
+    local want_docker=0 want_memcg=0
     local root_msg="Preparando a VPS com root (só desta vez)"
     HOST=${1:-}
     if [ -z "$HOST" ] || [ "${HOST#-}" != "$HOST" ]; then die "informe o HOST da VPS: deploy.sh vps HOST [opções]"; fi
@@ -326,13 +327,16 @@ run_vps() {
     # fora do modo certo). Só as portas não param o deploy sem sudo: fica o aviso, e a conferência
     # de fora no fim diz se o site responde.
     if [ -n "$domain" ] && { [ "$(pf PORTS)" != ok ] || [ "$(pf PORTS_MODE)" != "$ports_mode" ]; }; then want_ports=1; fi
-    if [ "$(pf ROOT_OK)" != yes ] || [ "$(pf LINGER)" != yes ] || [ "$want_caddy" = 1 ]; then
+    if [ "$(conf DOCKER)" = 1 ] && [ "$(pf DOCKER)" != ok ]; then want_docker=1; fi
+    if [ -n "$(conf MEMORY_MAX)" ] && [ "$(pf MEMCG)" != ok ]; then want_memcg=1; fi
+    if [ "$(pf ROOT_OK)" != yes ] || [ "$(pf LINGER)" != yes ] || [ "$want_caddy" = 1 ] ||
+        [ "$want_docker" = 1 ] || [ "$want_memcg" = 1 ]; then
         need_root=1
         case $(pf SUDO) in
             nopasswd) sudo_mode="sudo -n" ;;
             password)
                 interactive ||
-                    die "a VPS precisa de uma preparação com root (pasta, linger ou Caddy) e o usuário não tem sudo sem senha: rode este deploy num terminal."
+                    die "a VPS precisa de uma preparação com root (pasta, linger, Caddy, Docker ou memória) e o usuário não tem sudo sem senha: rode este deploy num terminal."
                 sudo_mode="sudo" ;;
             *) die "a VPS precisa de uma preparação com root (pasta, linger ou Caddy) e o usuário $(pf USER) não tem sudo." ;;
         esac
@@ -377,9 +381,9 @@ run_vps() {
     if [ "$need_root" = 1 ]; then
         log "$root_msg"
         if [ "$sudo_mode" = sudo ]; then
-            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode"
+            ssh -t -o ConnectTimeout=20 "$HOST" "sudo bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode $want_docker $want_memcg"
         else
-            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode" </dev/null
+            ssh_host "sudo -n bash $(pf HOME)/$stage/deploy.sh _root-setup $APP $(pf ROOT) $(pf USER) $want_caddy $want_ports $ports_mode $want_docker $want_memcg" </dev/null
         fi || die "a preparação com root falhou (veja acima)."
     fi
 
@@ -942,12 +946,66 @@ remote_preflight() { # app pasta obrigatórias...
     elif command -v sudo >/dev/null 2>&1 && id -nG "$me" | grep -qwE 'sudo|wheel|admin'; then echo SUDO=password
     else echo SUDO=none; fi
     [ -d /run/systemd/system ] || echo "ROOT_PROBLEM=a VPS não usa systemd; o devkit precisa dele."
+    if docker_ready "$me"; then echo DOCKER=ok; else echo DOCKER=setup; fi
+    if memcg_ready; then echo MEMCG=ok; else echo MEMCG=setup; fi
+}
+
+# DOCKER=1: Docker instalado, ativo e acessível ao usuário (pelo grupo docker).
+docker_ready() { # usuário
+    command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null &&
+        getent group docker | cut -d: -f4 | tr ',' '\n' | grep -qx "$1"
+}
+
+# MEMORY_MAX: o systemd delega o controle de memória ao gerenciador de serviços do usuário?
+memcg_ready() {
+    grep -qw memory "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" 2>/dev/null
 }
 
 # ---------- _root-setup: o que só root faz (pasta, linger, camada do Caddy, firewall) ----------
 
-remote_root_setup() { # app pasta usuário quer-caddy quer-portas modo-das-portas
-    local app=$1 root=$2 user=$3 want_caddy=$4 want_ports=$5 mode=${6:-open}
+# DOCKER=1. Instalado aqui, o Docker não mexe no firewall da VPS ("iptables": false): os apps do
+# devkit rodam containers sem rede própria (--network none) e constroem imagens com
+# --network host. Um Docker que já existia fica como está.
+setup_docker() { # usuário (como root)
+    if ! command -v docker >/dev/null; then
+        command -v apt-get >/dev/null || die "a instalação automática do Docker só funciona com apt (Debian/Ubuntu)."
+        log "Instalando o Docker (pacote docker.io, sem mexer no firewall)"
+        mkdir -p /etc/docker
+        [ -f /etc/docker/daemon.json ] || printf '{\n  "iptables": false,\n  "ip6tables": false\n}\n' > /etc/docker/daemon.json
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null
+        apt-get install -y -qq docker.io >/dev/null || die "não consegui instalar o Docker."
+    fi
+    systemctl enable --now docker >/dev/null 2>&1 || die "o Docker não iniciou: veja 'sudo journalctl -u docker -n 30'."
+    if ! getent group docker | cut -d: -f4 | tr ',' '\n' | grep -qx "$1"; then
+        usermod -aG docker "$1"
+        log "$1 no grupo docker (o app usa 'sg docker' até a próxima sessão)"
+    fi
+}
+
+# MEMORY_MAX. Delegação do controle de memória ao gerenciador de serviços dos usuários (padrão nas
+# distribuições atuais; aqui só para as que não fazem).
+setup_memcg() { # usuário (como root)
+    local uid dropin=/etc/systemd/system/user@.service.d/devkit-memory.conf
+    uid=$(id -u "$1")
+    if [ ! -f "$dropin" ]; then
+        mkdir -p "$(dirname "$dropin")"
+        printf '# devkit: MEMORY_MAX dos apps\n[Service]\nDelegate=cpu memory pids\n' > "$dropin"
+        systemctl daemon-reload
+        log "Controle de memória delegado aos serviços dos usuários ($dropin)"
+    fi
+    # Liga o controlador na árvore do usuário que já está rodando, sem reiniciá-la (os apps dele
+    # continuam de pé).
+    local cg=/sys/fs/cgroup/user.slice
+    for cg in "$cg" "$cg/user-$uid.slice" "$cg/user-$uid.slice/user@$uid.service"; do
+        if [ -f "$cg/cgroup.subtree_control" ]; then
+            echo +memory > "$cg/cgroup.subtree_control" 2>/dev/null || true
+        fi
+    done
+}
+
+remote_root_setup() { # app pasta usuário quer-caddy quer-portas modo-das-portas quer-docker quer-memória
+    local app=$1 root=$2 user=$3 want_caddy=$4 want_ports=$5 mode=${6:-open} want_docker=${7:-0} want_memcg=${8:-0}
     [ "$(id -u)" = 0 ] || die "a preparação precisa de root."
     if ! [[ $app =~ $APP_RE ]] || ! [[ $user =~ ^[a-z_][a-z0-9_-]*$ ]] || ! id "$user" >/dev/null 2>&1; then
         die "app ou usuário inválido."
@@ -963,6 +1021,8 @@ remote_root_setup() { # app pasta usuário quer-caddy quer-portas modo-das-porta
         log "Linger ativado para $user (os apps continuam rodando sem sessão aberta)"
     fi
     [ "$want_caddy" != 1 ] || setup_shared_caddy "$user"
+    [ "$want_docker" != 1 ] || setup_docker "$user"
+    [ "$want_memcg" != 1 ] || setup_memcg "$user"
     [ "$want_ports" != 1 ] || setup_ports_guard "$mode"
 }
 
@@ -971,8 +1031,8 @@ remote_root_setup() { # app pasta usuário quer-caddy quer-portas modo-das-porta
 site_path() { printf '%s' "$SHARED_DIR/sites/$APP.caddy"; }
 cert_base() { printf '%s' "$SHARED_DIR/certs/$APP"; }
 
-site_block() { # domínio porta
-    local tls="" guard=""
+site_block() { # domínio porta [caminhos-públicos]
+    local tls="" guard="" path routes=""
     # Com Certificado de Origem, o site está atrás do Cloudflare: conexões que não vêm das faixas
     # dele (alguém indo direto ao IP da VPS) são cortadas, mesmo sem firewall.
     if [ -f "$(cert_base).pem" ] && [ -f "$(cert_base).key" ]; then
@@ -981,6 +1041,28 @@ site_block() { # domínio porta
     fi
     # O app recebe o IP real do visitante em X-Forwarded-For e X-Real-IP (o {client_ip} do Caddy,
     # que atrás do Cloudflare é o CF-Connecting-IP); respostas comprimidas com zstd ou gzip.
+    if [ -n "${3:-}" ]; then
+        # PUBLIC_PATHS: só esses caminhos (e o de saúde, HEALTH) chegam ao app; o resto é 404 no
+        # Caddy. A saúde é a resposta do próprio app: com ele fora do ar, o Caddy devolve 502.
+        for path in $HEALTH $3; do routes+=" $path"; done
+        cat <<EOF
+# Gerado pelo devkit para o $APP. Não edite: é sobrescrito a cada deploy.
+$1 {$guard
+	encode zstd gzip
+	@public path$routes
+	handle @public {
+		reverse_proxy 127.0.0.1:$2 {
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Real-IP {client_ip}
+		}
+	}
+	handle {
+		respond 404
+	}$tls
+}
+EOF
+        return
+    fi
     cat <<EOF
 # Gerado pelo devkit para o $APP. Não edite: é sobrescrito a cada deploy.
 $1 {$guard
@@ -1159,14 +1241,25 @@ write_run_script() { # pasta-da-versão
             [[ $item =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "deploy.conf: SERVICE_ENV inválido: $item"
             printf 'export %s=%q\n' "${item%%=*}" "$(placeholders "${item#*=}")"
         done
+        if [ "$(kv_get "$1/deploy.conf" DOCKER)" = 1 ]; then
+            # Recém-adicionado ao grupo docker, o gerenciador de serviços do usuário ainda não o
+            # tem: "sg docker" ativa o grupo só para este processo.
+            printf 'id -nG | grep -qw docker || exec sg docker -c %q\n' "$1/.devkit-run"
+        fi
         printf 'cd %q\n' "$1"
         printf 'exec %s\n' "$(placeholders "$(kv_get "$1/deploy.conf" RUN)")"
     } > "$1/.devkit-run"
     chmod 755 "$1/.devkit-run"
 }
 
-install_unit() {
-    local dir="$HOME/.config/systemd/user" unit
+install_unit() { # pasta-da-versão
+    local dir="$HOME/.config/systemd/user" unit memory limits=""
+    memory=$(kv_get "$1/deploy.conf" MEMORY_MAX)
+    if [ -n "$memory" ]; then
+        [[ $memory =~ ^[0-9]+[KMGT]?$ ]] || die "deploy.conf: MEMORY_MAX inválido: $memory (ex.: 300M)"
+        # Limite de memória do serviço (e do swap, para o limite valer de verdade).
+        limits=$(printf '\nMemoryMax=%s\nMemorySwapMax=%s' "$memory" "$memory")
+    fi
     mkdir -p "$dir"
     unit="# Gerado pelo devkit para o $APP. Não edite: é sobrescrito a cada deploy.
 [Unit]
@@ -1181,7 +1274,7 @@ ExecStart=$ROOT/current/.devkit-run
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
-UMask=0077
+UMask=0077$limits
 
 [Install]
 WantedBy=default.target"
@@ -1202,6 +1295,21 @@ app_healthy() {
     done
     # Com site, o app também precisa responder no caminho de saúde.
     [ -z "$DOMAIN" ] || local_healthy "$PORT" "$HEALTH"
+}
+
+# MEMORY_MAX vale de verdade? Confere o limite no cgroup do serviço que está rodando.
+memory_problem() { # pasta-da-versão -> imprime o problema (vazio = ok ou sem MEMORY_MAX)
+    local max bytes cg got n unit
+    max=$(kv_get "$1/deploy.conf" MEMORY_MAX)
+    [ -n "$max" ] || return 0
+    n=${max%[KMGT]}
+    unit=${max#"$n"}
+    case $unit in K) bytes=$((n * 1024)) ;; M) bytes=$((n * 1024 ** 2)) ;; G) bytes=$((n * 1024 ** 3)) ;;
+        T) bytes=$((n * 1024 ** 4)) ;; *) bytes=$n ;; esac
+    cg=$(systemctl_user show -p ControlGroup --value "$APP")
+    got=$(cat "/sys/fs/cgroup$cg/memory.max" 2>/dev/null || true)
+    [ "$got" = "$bytes" ] ||
+        echo "MEMORY_MAX=$max não está valendo (limite no cgroup: ${got:-nenhum}). O systemd da VPS não delega o controle de memória ao usuário; rode o deploy num terminal, que o prepara com sudo."
 }
 
 switch_current() { # pasta da versão (troca atômica)
@@ -1274,7 +1382,7 @@ prepare_env() { # entradas pasta-da-versão
 }
 
 remote_release_up() { # app pasta versão
-    local release=$3 inputs="$DEVKIT_DIR/inputs" code staged="" previous problem k missing
+    local release=$3 inputs="$DEVKIT_DIR/inputs" code staged="" previous problem k missing public_paths
     APP=$1 ROOT=$2
     if ! [[ $APP =~ $APP_RE ]] || ! [[ $release =~ $RELEASE_RE ]]; then die "app ou versão inválidos."; fi
     mkdir -p "$ROOT" 2>/dev/null || true
@@ -1314,9 +1422,13 @@ remote_release_up() { # app pasta versão
 
     ensure_uv
     log "Instalando as dependências: $(kv_get "$code/deploy.conf" INSTALL)"
+    local install=(bash -c "$(kv_get "$code/deploy.conf" INSTALL)")
+    if [ "$(kv_get "$code/deploy.conf" DOCKER)" = 1 ] && ! id -nG | grep -qw docker; then
+        install=(sg docker -c "$(printf '%q ' "${install[@]}")")
+    fi
     (cd "$code" && PATH="$ROOT/tools/uv-$UV_VERSION:$PATH" UV_PYTHON_INSTALL_DIR="$ROOT/tools/python" \
         UV_CACHE_DIR="$ROOT/.cache/uv" UV_PYTHON_PREFERENCE=only-managed UV_PROJECT_ENVIRONMENT="$code/.venv" \
-        UV_NO_PROGRESS=1 bash -c "$(kv_get "$code/deploy.conf" INSTALL)") ||
+        UV_NO_PROGRESS=1 "${install[@]}") ||
         die "a instalação das dependências falhou. Nada foi alterado."
     write_run_script "$code"
 
@@ -1332,12 +1444,16 @@ remote_release_up() { # app pasta versão
             log "Certificado de Origem instalado em $(cert_base).pem e .key"
         fi
         staged="$ROOT/.devkit/site.caddy"
-        site_block "$DOMAIN" "$PORT" > "$staged"
+        public_paths=$(kv_get "$code/deploy.conf" PUBLIC_PATHS)
+        for k in $public_paths; do
+            [[ $k =~ ^/[A-Za-z0-9._~/-]*$ ]] || die "deploy.conf: PUBLIC_PATHS inválido: $k"
+        done
+        site_block "$DOMAIN" "$PORT" "$public_paths" > "$staged"
         caddy_validate_with "$staged" || die "a configuração do Caddy não valida com o site do $APP (veja acima). Nada foi alterado."
     fi
 
     log "Ativando a versão $release"
-    install_unit
+    install_unit "$code"
     previous=$(readlink "$ROOT/current" 2>/dev/null || true)
     mv "$ROOT/.devkit/env.new" "$ROOT/.env"
     printf '%s\n' "$DOMAIN" > "$ROOT/.devkit/domain"
@@ -1357,6 +1473,19 @@ remote_release_up() { # app pasta versão
         die "o $APP não ficou de pé (veja o log acima)."
     fi
 
+    problem=$(memory_problem "$code")
+    if [ -n "$problem" ] && memcg_ready; then
+        # Controlador recém-delegado: o gerenciador do usuário só o enxerga depois de se
+        # reexecutar (os serviços dele continuam de pé).
+        systemctl_user daemon-reexec
+        systemctl_user restart "$APP"
+        sleep 2
+        problem=$(memory_problem "$code")
+    fi
+    if [ -n "$problem" ]; then
+        systemctl_user stop "$APP"
+        die "o $APP foi parado: $problem"
+    fi
     if [ -n "$staged" ]; then publish_site "$staged"; else unpublish_site; fi
     prune_releases
     log "Rodando: $APP versão $release em $ROOT (porta interna $PORT)"
@@ -1382,7 +1511,7 @@ main() {
         ci) run_ci ;;
         status | logs | restart | stop) run_helper "$1" "${2:-}" ;;
         _preflight) shift; remote_preflight "$@" ;;
-        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
+        _root-setup) remote_root_setup "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" ;;
         _open-ports) [ "$(id -u)" = 0 ] || die "_open-ports precisa de root."; open_web_ports ;;
         _release-up) remote_release_up "${2:-}" "${3:-}" "${4:-}" ;;
         -h | --help | help | "") usage 0 ;;
