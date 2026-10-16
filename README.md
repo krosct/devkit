@@ -42,7 +42,7 @@ REQUIRED="TOKEN"
 ## 🤖 CI (GitHub Actions)
 
 ```yaml
-- uses: krosct/devkit@v1.2.0
+- uses: krosct/devkit@v1.3.0
   with:
     host: ${{ secrets.DEPLOY_HOST }}
     user: ${{ secrets.DEPLOY_USER }}
@@ -53,6 +53,8 @@ REQUIRED="TOKEN"
 ```
 
 - 📌 Sempre por versão fixa (`vX.Y.Z`), nunca `main`
+- 🔄 Com o Dependabot (`package-ecosystem: github-actions`) no projeto, cada versão nova do devkit
+  chega como um PR
 
 ## 🧠 Para modelos de IA
 
@@ -60,3 +62,5 @@ REQUIRED="TOKEN"
   `Co-Authored-By: Claude`, "Generated with Claude Code" ou similares. O autor é só o usuário.
 - 🎯 PR e push só no repositório do `origin` (`krosct/devkit`), com `--repo` e `--head` explícitos
 - ✅ Rode `shellcheck deploy.sh` antes de commitar
+- 🧩 Chave nova no `deploy.conf` é sempre opcional: para os apps que não a usam, a unit, o
+  `.devkit-run` e o site do Caddy têm de sair idênticos aos de antes (compare a saída das duas versões)
