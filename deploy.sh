@@ -199,19 +199,51 @@ missing_after_merge() { # arquivo-enviado(ou "") preserva(0/1)
 
 ssh_host() { ssh -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST" "$@"; }
 
+exclude_paths() { # EXCLUDE normalizado (um caminho por linha); vazio sem EXCLUDE
+    local exc inc
+    for exc in $(conf EXCLUDE); do
+        exc=${exc#./}
+        exc=${exc%/}
+        [[ -n $exc && $exc != /* && $exc != *..* ]] || die "EXCLUDE: caminho inválido: $exc (relativo à raiz do projeto)."
+        [ "$exc" != deploy.conf ] || die "EXCLUDE: o deploy.conf não pode sair do pacote."
+        for inc in $(conf INCLUDE); do
+            inc=${inc#./}
+            inc=${inc%/}
+            case "$inc/" in "$exc"/*) die "EXCLUDE: $exc cobre o INCLUDE $inc." ;; esac
+            case "$exc/" in "$inc"/*) die "EXCLUDE: $exc está dentro do INCLUDE $inc." ;; esac
+        done
+        printf '%s\n' "$exc"
+    done
+}
+
+keep_files() { # filtra a lista de arquivos (stdin) tirando o que está nos caminhos dados; sem nenhum, passa tudo
+    local f exc
+    while IFS= read -r f; do
+        for exc in "$@"; do
+            case $f in "$exc" | "$exc"/*) continue 2 ;; esac
+        done
+        printf '%s\n' "$f"
+    done
+}
+
 build_package() { # destino.tgz
-    local inc
+    local inc paths
+    local -a exclude=()
     git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "o projeto precisa estar num repositório git."
+    # antes do build: um EXCLUDE errado para o deploy logo (o die do subshell sai com 1)
+    paths=$(exclude_paths) || exit 1
+    [ -z "$paths" ] || mapfile -t exclude <<<"$paths"
     if [ -n "$(conf BUILD)" ]; then
         log "Build: $(conf BUILD)"
         bash -c "$(conf BUILD)" || die "o build falhou."
     fi
-    # Versionado + novo não ignorado + INCLUDE (ex.: saída do build); nunca o .env.
+    # Versionado + novo não ignorado + INCLUDE (ex.: saída do build), menos o EXCLUDE; nunca o .env.
     {
         git ls-files
         git ls-files --others --exclude-standard
         for inc in $(conf INCLUDE); do find "$inc" -type f 2>/dev/null || die "INCLUDE: $inc não existe (o build gerou?)."; done
-    } | sort -u | grep -vE '(^|/)\.env$' | while IFS= read -r f; do if [ -e "$f" ]; then printf '%s\n' "$f"; fi; done |
+    } | sort -u | grep -vE '(^|/)\.env$' | keep_files "${exclude[@]}" |
+        while IFS= read -r f; do if [ -e "$f" ]; then printf '%s\n' "$f"; fi; done |
         tar -czf "$1" -T -
 }
 
